@@ -125,6 +125,25 @@ def _secure_fetch_sync(url: str) -> Tuple[Optional[Any], Optional[str]]:
                 loc = resp.headers.get('Location', '')
                 if not loc:
                     return None, 'Redirect with no Location header'
+                # Re-validate redirect target - prevents SSRF via open redirects
+                _redir, _err = _fetch_rss_feed(loc)
+                # We only need the SSRF check, not a full fetch - validate URL structure
+                try:
+                    redir_parsed = urlparse(loc)
+                    if redir_parsed.scheme not in ('http', 'https'):
+                        return None, 'Redirect to non-HTTP URL blocked'
+                    redir_host = redir_parsed.hostname or ''
+                    if redir_host.lower() in blocked_hosts:
+                        return None, 'Redirect to localhost blocked'
+                    for suf in blocked_suffixes:
+                        if redir_host.lower().endswith(suf):
+                            return None, 'Redirect to internal domain blocked'
+                    for _fam, _t, _p, _cn, sockaddr in socket.getaddrinfo(redir_host, None):
+                        ip = ipaddress.ip_address(sockaddr[0])
+                        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
+                            return None, f'Redirect to private IP blocked: {sockaddr[0]}'
+                except socket.gaierror:
+                    pass
                 current_url = loc
                 continue
 
