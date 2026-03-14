@@ -174,16 +174,17 @@ def _get_web_level(xp: int, db) -> int:
     return level
 
 
-def _award_web_xp(fluxer_user_id: str, action_type: str, ref_id: str):
+def _award_web_xp(fluxer_user_id: str, action_type: str, ref_id: str) -> tuple[bool, int]:
     """
     Award XP to the unified QuestLog profile for a linked Fluxer user.
     Looks up web_user via web_users.fluxer_id, writes to web_xp_events,
     and updates web_users.web_xp / web_level / hero_points in one transaction.
     No-op if user is not linked.
+    Returns (web_leveled_up, new_web_level).
     """
     xp_amount = FLUXER_XP.get(action_type)
     if not xp_amount:
-        return
+        return False, 0
     try:
         with db_session_scope() as db:
             row = db.execute(
@@ -191,7 +192,7 @@ def _award_web_xp(fluxer_user_id: str, action_type: str, ref_id: str):
                 {"fid": fluxer_user_id},
             ).fetchone()
             if not row:
-                return  # User not linked - only bot-local XP applies
+                return False, 0  # User not linked - only bot-local XP applies
 
             web_user_id = row.id
             old_xp = row.web_xp or 0
@@ -201,13 +202,13 @@ def _award_web_xp(fluxer_user_id: str, action_type: str, ref_id: str):
             # ref_id is required for dedup - refuse to award without it to prevent duplicates
             if not ref_id:
                 logger.error(f"_award_web_xp called without ref_id for action_type={action_type}, refusing to award")
-                return
+                return False, 0
             dup = db.execute(
                 text("SELECT id FROM web_xp_events WHERE user_id = :uid AND action_type = :at AND ref_id = :ref LIMIT 1"),
                 {"uid": web_user_id, "at": action_type, "ref": ref_id},
             ).fetchone()
             if dup:
-                return
+                return False, old_level
 
             now = int(time.time())
             new_xp = old_xp + xp_amount
@@ -229,7 +230,8 @@ def _award_web_xp(fluxer_user_id: str, action_type: str, ref_id: str):
 
             # Level-up
             new_level = _get_web_level(new_xp, db)
-            if new_level > old_level:
+            web_leveled_up = new_level > old_level
+            if web_leveled_up:
                 hp_from_level = (new_level - old_level) * HP_PER_LEVEL
                 hero_points += hp_from_level
                 db.execute(text(
@@ -241,8 +243,10 @@ def _award_web_xp(fluxer_user_id: str, action_type: str, ref_id: str):
                 "UPDATE web_users SET web_xp = :xp, web_level = :lvl, hero_points = :hp WHERE id = :uid"
             ), {"xp": new_xp, "lvl": new_level, "hp": hero_points, "uid": web_user_id})
             db.commit()
+            return web_leveled_up, new_level
     except Exception as e:
         logger.warning(f"_award_web_xp failed for fluxer_id={fluxer_user_id}: {e}")
+    return False, 0
 
 
 BRAND_COLOR = 0x66aa8b  # Fluxer green
@@ -526,8 +530,13 @@ class XpCog(Cog):
         except Exception as e:
             logger.error(f"Failed to award bot XP: {e}", exc_info=True)
 
-        # Also award to unified web profile if user has linked their QuestLog account
-        _award_web_xp(user_id, 'fluxer_message', ref_id)
+        # Also award to unified web profile if user has linked their QuestLog account.
+        # If the unified web level went up (and guild local didn't already trigger one),
+        # surface a level-up so the user still gets notified on Fluxer.
+        web_leveled_up, web_new_level = _award_web_xp(user_id, 'fluxer_message', ref_id)
+        if web_leveled_up and not leveled_up:
+            leveled_up = True
+            new_level = web_new_level
         return leveled_up, new_level
 
     async def _apply_level_roles(self, guild_id: str, user_id: str, new_level: int, db):
