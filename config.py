@@ -8,7 +8,7 @@ from pathlib import Path
 from urllib.parse import quote_plus
 
 from dotenv import load_dotenv
-from sqlalchemy import create_engine, event
+from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, scoped_session
 from sqlalchemy.pool import QueuePool
 
@@ -45,15 +45,22 @@ logger = logging.getLogger("fluxer")
 logger.handlers.clear()
 logger.propagate = True
 
-# ====== Fluxer API Config ======
-
-FLUXER_API_BASE = os.getenv("FLUXER_API_BASE", "https://api.fluxer.app")
-FLUXER_API_VERSION = os.getenv("FLUXER_API_VERSION", "1")
-FLUXER_GATEWAY_URL = os.getenv("FLUXER_GATEWAY_URL", "wss://gateway.fluxer.app")
-FLUXER_API_URL = f"{FLUXER_API_BASE}/v{FLUXER_API_VERSION}"
+# ====== Bot Config ======
 
 COMMAND_PREFIX = os.getenv("COMMAND_PREFIX", "!")
 IS_PRODUCTION = os.getenv("ENVIRONMENT", "development").lower() == "production"
+
+# QuestLog web platform internal API (for bot <-> web comms)
+QUESTLOG_INTERNAL_API_URL = os.getenv("QUESTLOG_INTERNAL_API_URL", "https://casual-heroes.com/ql")
+QUESTLOG_BOT_SECRET = os.getenv("QUESTLOG_BOT_SECRET", "")
+
+# IGDB (uses Twitch OAuth) - same creds as wardenbot
+IGDB_CLIENT_ID = os.getenv("TWITCH_CLIENT_ID") or os.getenv("IGDB_CLIENT_ID", "")
+IGDB_CLIENT_SECRET = os.getenv("TWITCH_CLIENT_SECRET") or os.getenv("IGDB_CLIENT_SECRET", "")
+
+# Early access - comma-separated Fluxer guild IDs where !invite command is allowed
+# e.g. EARLY_ACCESS_GUILD_IDS=1474761008438513445
+EARLY_ACCESS_GUILD_IDS_RAW = os.getenv("EARLY_ACCESS_GUILD_IDS", "")
 
 
 def get_bot_token() -> str:

@@ -1,186 +1,220 @@
 # cogs/moderation.py - Moderation commands
 #
-# !ban, !kick, !timeout, !unban
+# !ban, !tempban, !kick, !timeout
+# Uses fluxer.checks for permission checking (owner + ADMINISTRATOR bypass built in).
 # Uses Fluxer-specific fields: ban_duration_seconds, timeout_reason
+# All responses use embeds.
 #
-# TODO slash commands: /ban, /kick, /timeout, /unban
+# TODO slash commands: /ban, /kick, /timeout, /tempban
 
 import datetime
+import fluxer
+from fluxer import Cog
+from fluxer.checks import has_permission
+from fluxer.enums import Permissions
 from config import logger
 
-
-def _has_mod_permission(member_roles: list, mod_role_ids: set) -> bool:
-    """Check if a member has a mod role. Override in guild config."""
-    return bool(set(member_roles) & mod_role_ids)
-
-
-async def _get_member_roles(client, guild_id: str, user_id: str) -> list:
-    try:
-        data = await client.get(f"/guilds/{guild_id}/members/{user_id}")
-        return data.get("roles", [])
-    except Exception:
-        return []
+RED_COLOR = 0xED4245
+ORANGE_COLOR = 0xFEE75C
+GREEN_COLOR = 0x57F287
 
 
-class ModerationCog:
-    def __init__(self, client):
-        self._client = client
-        # TODO: load per-guild mod role IDs from DB
-        self._mod_role_ids: set = set()
+def _parse_mention(text: str) -> str | None:
+    """Extract user ID from <@123> or plain ID."""
+    text = text.strip()
+    if text.startswith("<@") and text.endswith(">"):
+        return text[2:-1].lstrip("!")
+    if text.isdigit():
+        return text
+    return None
 
-    async def _check_mod(self, message: dict) -> bool:
-        """Return True if message author has mod permissions."""
-        guild_id = message.get("guild_id")
-        if not guild_id:
-            return False
-        user_id = message["author"]["id"]
-        roles = await _get_member_roles(self._client, guild_id, user_id)
-        if not roles and not self._mod_role_ids:
-            # No mod roles configured - only guild owner can use commands
-            try:
-                guild = await self._client.get(f"/guilds/{guild_id}")
-                return guild.get("owner_id") == user_id
-            except Exception:
-                return False
-        return _has_mod_permission(roles, self._mod_role_ids)
 
-    def _parse_mention(self, text: str) -> str | None:
-        """Extract user ID from <@123> or plain ID."""
-        text = text.strip()
-        if text.startswith("<@") and text.endswith(">"):
-            return text[2:-1].lstrip("!")
-        if text.isdigit():
-            return text
-        return None
+class ModerationCog(Cog):
+    def __init__(self, bot):
+        super().__init__(bot)
 
-    # ====== Commands ======
-
-    async def cmd_ban(self, message: dict, args: list):
+    @Cog.command()
+    @has_permission(Permissions.BAN_MEMBERS)
+    async def ban(self, ctx, *args):
         """!ban @user [reason] - Permanently ban a member."""
-        if not await self._check_mod(message):
-            await self._client.send_reply(message, "You don't have permission to use this command.")
-            return
-
         if not args:
-            await self._client.send_reply(message, "Usage: `!ban @user [reason]`")
+            embed = fluxer.Embed(
+                title="Ban Member",
+                description="**Usage:** `!ban @user [reason]`",
+                color=RED_COLOR,
+            )
+            await ctx.reply(embed=embed)
             return
 
-        user_id = self._parse_mention(args[0])
+        user_id = _parse_mention(args[0])
         if not user_id:
-            await self._client.send_reply(message, "Please mention a valid user.")
+            embed = fluxer.Embed(title="Invalid User", description="Please mention a valid user.", color=RED_COLOR)
+            await ctx.reply(embed=embed)
             return
 
         reason = " ".join(args[1:]) or "No reason provided"
-        guild_id = message["guild_id"]
+        guild_id = str(ctx.guild.id)
 
         try:
-            await self._client.ban_member(guild_id, user_id, reason=reason, delete_message_days=1)
-            await self._client.send_reply(message, f"Banned <@{user_id}>. Reason: {reason}")
+            await self.bot.http.ban_guild_member(guild_id, user_id, reason=reason, delete_message_days=1)
+            embed = fluxer.Embed(
+                title="Member Banned",
+                description=f"<@{user_id}> has been permanently banned.",
+                color=RED_COLOR,
+            )
+            embed.add_field(name="Reason", value=reason, inline=False)
+            embed.add_field(name="Banned by", value=ctx.author.username, inline=True)
+            embed.set_footer(text="QuestLog Moderation")
+            await ctx.reply(embed=embed)
             logger.info(f"Banned {user_id} from {guild_id} - {reason}")
         except Exception as e:
             logger.error(f"Ban failed: {e}", exc_info=True)
-            await self._client.send_reply(message, "Failed to ban user.")
+            embed = fluxer.Embed(title="Error", description="Failed to ban user. Check bot permissions.", color=RED_COLOR)
+            await ctx.reply(embed=embed)
 
-    async def cmd_tempban(self, message: dict, args: list):
+    @Cog.command()
+    @has_permission(Permissions.BAN_MEMBERS)
+    async def tempban(self, ctx, *args):
         """!tempban @user <hours> [reason] - Temporarily ban a member."""
-        if not await self._check_mod(message):
-            await self._client.send_reply(message, "You don't have permission to use this command.")
-            return
-
         if len(args) < 2:
-            await self._client.send_reply(message, "Usage: `!tempban @user <hours> [reason]`")
+            embed = fluxer.Embed(
+                title="Temp Ban Member",
+                description="**Usage:** `!tempban @user <hours> [reason]`\n**Example:** `!tempban @user 24 spamming`",
+                color=ORANGE_COLOR,
+            )
+            await ctx.reply(embed=embed)
             return
 
-        user_id = self._parse_mention(args[0])
+        user_id = _parse_mention(args[0])
         if not user_id:
-            await self._client.send_reply(message, "Please mention a valid user.")
+            embed = fluxer.Embed(title="Invalid User", description="Please mention a valid user.", color=RED_COLOR)
+            await ctx.reply(embed=embed)
             return
 
         try:
             hours = int(args[1])
         except ValueError:
-            await self._client.send_reply(message, "Hours must be a number.")
+            embed = fluxer.Embed(title="Invalid Duration", description="Hours must be a number.", color=RED_COLOR)
+            await ctx.reply(embed=embed)
             return
 
         reason = " ".join(args[2:]) or "No reason provided"
-        guild_id = message["guild_id"]
+        guild_id = str(ctx.guild.id)
 
         try:
-            await self._client.ban_member(
+            await self.bot.http.ban_guild_member(
                 guild_id, user_id,
                 reason=reason,
                 delete_message_days=0,
-                duration_seconds=hours * 3600,
+                ban_duration_seconds=hours * 3600,
             )
-            await self._client.send_reply(
-                message, f"Temp-banned <@{user_id}> for {hours}h. Reason: {reason}"
+            embed = fluxer.Embed(
+                title="Member Temp Banned",
+                description=f"<@{user_id}> has been temporarily banned.",
+                color=ORANGE_COLOR,
             )
+            embed.add_field(name="Duration", value=f"{hours} hour(s)", inline=True)
+            embed.add_field(name="Reason", value=reason, inline=False)
+            embed.add_field(name="Banned by", value=ctx.author.username, inline=True)
+            embed.set_footer(text="QuestLog Moderation")
+            await ctx.reply(embed=embed)
+            logger.info(f"Temp-banned {user_id} from {guild_id} for {hours}h - {reason}")
         except Exception as e:
             logger.error(f"Tempban failed: {e}", exc_info=True)
-            await self._client.send_reply(message, "Failed to temp-ban user.")
+            embed = fluxer.Embed(title="Error", description="Failed to temp-ban user. Check bot permissions.", color=RED_COLOR)
+            await ctx.reply(embed=embed)
 
-    async def cmd_kick(self, message: dict, args: list):
+    @Cog.command()
+    @has_permission(Permissions.KICK_MEMBERS)
+    async def kick(self, ctx, *args):
         """!kick @user [reason] - Kick a member."""
-        if not await self._check_mod(message):
-            await self._client.send_reply(message, "You don't have permission to use this command.")
-            return
-
         if not args:
-            await self._client.send_reply(message, "Usage: `!kick @user [reason]`")
+            embed = fluxer.Embed(
+                title="Kick Member",
+                description="**Usage:** `!kick @user [reason]`",
+                color=ORANGE_COLOR,
+            )
+            await ctx.reply(embed=embed)
             return
 
-        user_id = self._parse_mention(args[0])
+        user_id = _parse_mention(args[0])
         if not user_id:
-            await self._client.send_reply(message, "Please mention a valid user.")
+            embed = fluxer.Embed(title="Invalid User", description="Please mention a valid user.", color=RED_COLOR)
+            await ctx.reply(embed=embed)
             return
 
-        guild_id = message["guild_id"]
         reason = " ".join(args[1:]) or "No reason provided"
+        guild_id = str(ctx.guild.id)
 
         try:
-            await self._client.kick_member(guild_id, user_id)
-            await self._client.send_reply(message, f"Kicked <@{user_id}>. Reason: {reason}")
+            await self.bot.http.kick_guild_member(guild_id, user_id, reason=reason)
+            embed = fluxer.Embed(
+                title="Member Kicked",
+                description=f"<@{user_id}> has been kicked from the server.",
+                color=ORANGE_COLOR,
+            )
+            embed.add_field(name="Reason", value=reason, inline=False)
+            embed.add_field(name="Kicked by", value=ctx.author.username, inline=True)
+            embed.set_footer(text="QuestLog Moderation")
+            await ctx.reply(embed=embed)
             logger.info(f"Kicked {user_id} from {guild_id} - {reason}")
         except Exception as e:
             logger.error(f"Kick failed: {e}", exc_info=True)
-            await self._client.send_reply(message, "Failed to kick user.")
+            embed = fluxer.Embed(title="Error", description="Failed to kick user. Check bot permissions.", color=RED_COLOR)
+            await ctx.reply(embed=embed)
 
-    async def cmd_timeout(self, message: dict, args: list):
+    @Cog.command()
+    @has_permission(Permissions.MODERATE_MEMBERS)
+    async def timeout(self, ctx, *args):
         """!timeout @user <minutes> [reason] - Timeout a member."""
-        if not await self._check_mod(message):
-            await self._client.send_reply(message, "You don't have permission to use this command.")
-            return
-
         if len(args) < 2:
-            await self._client.send_reply(message, "Usage: `!timeout @user <minutes> [reason]`")
+            embed = fluxer.Embed(
+                title="Timeout Member",
+                description="**Usage:** `!timeout @user <minutes> [reason]`\n**Example:** `!timeout @user 10 spam`",
+                color=ORANGE_COLOR,
+            )
+            await ctx.reply(embed=embed)
             return
 
-        user_id = self._parse_mention(args[0])
+        user_id = _parse_mention(args[0])
         if not user_id:
-            await self._client.send_reply(message, "Please mention a valid user.")
+            embed = fluxer.Embed(title="Invalid User", description="Please mention a valid user.", color=RED_COLOR)
+            await ctx.reply(embed=embed)
             return
 
         try:
             minutes = int(args[1])
         except ValueError:
-            await self._client.send_reply(message, "Minutes must be a number.")
+            embed = fluxer.Embed(title="Invalid Duration", description="Minutes must be a number.", color=RED_COLOR)
+            await ctx.reply(embed=embed)
             return
 
         reason = " ".join(args[2:]) or "No reason provided"
-        guild_id = message["guild_id"]
+        guild_id = str(ctx.guild.id)
         until = (
             datetime.datetime.utcnow() + datetime.timedelta(minutes=minutes)
         ).strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
         try:
-            await self._client.timeout_member(guild_id, user_id, until=until, reason=reason)
-            await self._client.send_reply(
-                message, f"Timed out <@{user_id}> for {minutes} minutes. Reason: {reason}"
+            await self.bot.http.edit_guild_member(
+                guild_id, user_id,
+                communication_disabled_until=until,
+                reason=reason,
             )
+            embed = fluxer.Embed(
+                title="Member Timed Out",
+                description=f"<@{user_id}> has been timed out.",
+                color=ORANGE_COLOR,
+            )
+            embed.add_field(name="Duration", value=f"{minutes} minute(s)", inline=True)
+            embed.add_field(name="Reason", value=reason, inline=False)
+            embed.add_field(name="Timed out by", value=ctx.author.username, inline=True)
+            embed.set_footer(text="QuestLog Moderation")
+            await ctx.reply(embed=embed)
         except Exception as e:
             logger.error(f"Timeout failed: {e}", exc_info=True)
-            await self._client.send_reply(message, "Failed to timeout user.")
+            embed = fluxer.Embed(title="Error", description="Failed to timeout user. Check bot permissions.", color=RED_COLOR)
+            await ctx.reply(embed=embed)
 
     # TODO: /ban, /kick, /timeout, /tempban slash commands
-    # TODO: load mod role IDs from DB per guild
     # TODO: audit log integration

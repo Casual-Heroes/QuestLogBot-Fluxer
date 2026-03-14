@@ -3,39 +3,51 @@
 # Run with: python bot.py
 
 import asyncio
-import signal
-import sys
-
+import fluxer
 from config import get_bot_token, COMMAND_PREFIX, logger
-from client import FluxerClient
 from cogs.core import CoreCog
 from cogs.xp import XpCog
 from cogs.moderation import ModerationCog
 from cogs.lfg import LfgCog
+from cogs.flair_sync import FlairSyncCog
+from cogs.invite import InviteCog
+from cogs.bridge import BridgeCog
+from cogs.member_sync import MemberSyncCog
+from cogs.welcome import WelcomeCog
+from cogs.discovery import DiscoveryCog
+from cogs.rss import RssCog
+from cogs.trackers import TrackersCog
+from cogs.live_alerts import LiveAlertsCog
+
+intents = fluxer.Intents.default()
+
+bot = fluxer.Bot(command_prefix=COMMAND_PREFIX, intents=intents)
+
+
+@bot.event
+async def on_ready():
+    # Wait briefly for GUILD_CREATE events to arrive after READY
+    await asyncio.sleep(2)
+    logger.info(f"Logged in as {bot.user} - serving {len(bot.guilds)} communities")
 
 
 async def main():
     token = get_bot_token()
-    client = FluxerClient(token=token, command_prefix=COMMAND_PREFIX)
-
-    # Load cogs
-    client.add_cog(CoreCog(client))
-    client.add_cog(XpCog(client))
-    client.add_cog(ModerationCog(client))
-    client.add_cog(LfgCog(client))
-
-    # Graceful shutdown on SIGTERM/SIGINT
-    loop = asyncio.get_running_loop()
-
-    def _shutdown():
-        logger.info("Shutdown signal received")
-        asyncio.create_task(client.close())
-
-    for sig in (signal.SIGTERM, signal.SIGINT):
-        loop.add_signal_handler(sig, _shutdown)
-
+    await bot.add_cog(CoreCog(bot))
+    await bot.add_cog(XpCog(bot))
+    await bot.add_cog(ModerationCog(bot))
+    await bot.add_cog(LfgCog(bot))
+    await bot.add_cog(FlairSyncCog(bot))
+    await bot.add_cog(InviteCog(bot))
+    await bot.add_cog(BridgeCog(bot))
+    await bot.add_cog(MemberSyncCog(bot))
+    await bot.add_cog(WelcomeCog(bot))
+    await bot.add_cog(DiscoveryCog(bot))
+    await bot.add_cog(RssCog(bot))
+    await bot.add_cog(TrackersCog(bot))
+    await bot.add_cog(LiveAlertsCog(bot))
     logger.info("Starting QuestLog Fluxer Bot...")
-    await client.start()
+    await bot.start(token)
 
 
 if __name__ == "__main__":
