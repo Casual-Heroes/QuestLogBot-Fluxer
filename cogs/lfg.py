@@ -323,12 +323,54 @@ class LfgCog(Cog):
                 logger.error(f"Broadcast poll loop error: {e}", exc_info=True)
             await asyncio.sleep(POLL_INTERVAL)
 
+    def _build_embed(self, embed_data: dict) -> fluxer.Embed:
+        """Build a fluxer.Embed from a payload dict."""
+        embed = fluxer.Embed(
+            title=embed_data.get("title", ""),
+            description=embed_data.get("description", ""),
+            color=embed_data.get("color", GOLD_COLOR),
+            url=embed_data.get("url") or None,
+        )
+        for field in embed_data.get("fields", []):
+            embed.add_field(
+                name=field["name"],
+                value=field["value"],
+                inline=field.get("inline", True),
+            )
+        if embed_data.get("thumbnail"):
+            embed.set_thumbnail(url=embed_data["thumbnail"])
+        if embed_data.get("footer"):
+            embed.set_footer(text=embed_data["footer"])
+        return embed
+
+    async def _pin_message(self, channel_id: str, message_id: str):
+        """Pin a message via raw API call."""
+        try:
+            route = self.bot._http._route(
+                "PUT", "/channels/{channel_id}/pins/{message_id}",
+                channel_id=channel_id, message_id=message_id,
+            )
+            await self.bot._http.request(route)
+        except Exception as e:
+            logger.warning(f"Failed to pin message {message_id} in channel {channel_id}: {e}")
+
+    async def _unpin_message(self, channel_id: str, message_id: str):
+        """Unpin a message via raw API call."""
+        try:
+            route = self.bot._http._route(
+                "DELETE", "/channels/{channel_id}/pins/{message_id}",
+                channel_id=channel_id, message_id=message_id,
+            )
+            await self.bot._http.request(route)
+        except Exception as e:
+            logger.warning(f"Failed to unpin message {message_id} in channel {channel_id}: {e}")
+
     async def _dispatch_pending_broadcasts(self):
         try:
             with db_session_scope() as db:
                 rows = db.execute(
                     text(
-                        "SELECT id, channel_id, payload FROM fluxer_pending_broadcasts "
+                        "SELECT id, guild_id, channel_id, payload FROM fluxer_pending_broadcasts "
                         "WHERE dispatched_at IS NULL "
                         "ORDER BY created_at ASC LIMIT 10"
                     )
@@ -340,28 +382,77 @@ class LfgCog(Cog):
                 now = int(time.time())
                 dispatched_ids = []
 
-                for row_id, channel_id, payload_json in rows:
+                for row_id, guild_id, channel_id, payload_json in rows:
                     try:
                         embed_data = json.loads(payload_json)
+                        action = embed_data.get("action", "post")
+                        track_group_id = embed_data.get("track_group_id")
+                        track_group_platform = embed_data.get("track_group_platform", "web")
+
+                        if action == "edit" and track_group_id:
+                            # Edit the existing pinned message in-place
+                            existing = db.execute(
+                                text(
+                                    "SELECT message_id, channel_id FROM web_lfg_channel_messages "
+                                    "WHERE group_id=:gid AND group_platform=:gp AND platform='fluxer' AND guild_id=:guild "
+                                    "LIMIT 1"
+                                ),
+                                {"gid": int(track_group_id), "gp": track_group_platform, "guild": str(guild_id)},
+                            ).fetchone()
+                            if existing:
+                                stored_msg_id, stored_ch_id = existing
+                                embed = self._build_embed(embed_data)
+                                try:
+                                    await self.bot._http.edit_message(
+                                        str(stored_ch_id), str(stored_msg_id),
+                                        embeds=[embed.to_dict()],
+                                    )
+                                    # Re-pin if group reopened (action carries pin_state)
+                                    pin_state = embed_data.get("pin_state")  # "pin" or "unpin"
+                                    if pin_state == "unpin":
+                                        await self._unpin_message(str(stored_ch_id), str(stored_msg_id))
+                                    elif pin_state == "pin":
+                                        await self._pin_message(str(stored_ch_id), str(stored_msg_id))
+                                except Exception as edit_err:
+                                    logger.warning(f"Failed to edit message {stored_msg_id}: {edit_err}")
+                            dispatched_ids.append(row_id)
+                            continue
+
+                        # action == "post" - send new message, pin it, store ID
                         channel = await self.bot.fetch_channel(int(channel_id))
-                        embed_url = embed_data.get("url") or None
-                        embed = fluxer.Embed(
-                            title=embed_data.get("title", ""),
-                            description=embed_data.get("description", ""),
-                            color=embed_data.get("color", GOLD_COLOR),
-                            url=embed_url,
-                        )
-                        for field in embed_data.get("fields", []):
-                            embed.add_field(
-                                name=field["name"],
-                                value=field["value"],
-                                inline=field.get("inline", True),
-                            )
-                        if embed_data.get("thumbnail"):
-                            embed.set_thumbnail(url=embed_data["thumbnail"])
-                        if embed_data.get("footer"):
-                            embed.set_footer(text=embed_data["footer"])
-                        await channel.send(embed=embed)
+                        embed = self._build_embed(embed_data)
+                        sent = await channel.send(embed=embed)
+                        new_message_id = str(sent.id) if sent and hasattr(sent, 'id') else None
+
+                        if new_message_id:
+                            # Pin immediately
+                            await self._pin_message(str(channel_id), new_message_id)
+
+                            # Store message ID for future edits
+                            if track_group_id and guild_id:
+                                db.execute(
+                                    text(
+                                        "DELETE FROM web_lfg_channel_messages "
+                                        "WHERE group_id=:gid AND group_platform=:gp AND platform='fluxer' AND guild_id=:guild"
+                                    ),
+                                    {"gid": int(track_group_id), "gp": track_group_platform, "guild": str(guild_id)},
+                                )
+                                db.execute(
+                                    text(
+                                        "INSERT INTO web_lfg_channel_messages "
+                                        "(group_id, group_platform, platform, guild_id, channel_id, message_id, created_at) "
+                                        "VALUES (:gid, :gp, 'fluxer', :guild, :ch, :mid, :ts)"
+                                    ),
+                                    {
+                                        "gid": int(track_group_id),
+                                        "gp": track_group_platform,
+                                        "guild": str(guild_id),
+                                        "ch": str(channel_id),
+                                        "mid": new_message_id,
+                                        "ts": now,
+                                    },
+                                )
+
                         dispatched_ids.append(row_id)
                     except Exception as e:
                         logger.warning(f"Failed to dispatch broadcast {row_id} to channel {channel_id}: {e}")
@@ -508,8 +599,11 @@ class LfgCog(Cog):
             ))
             return
 
-        # Subcommand routing: !lfg list and !lfg delete still work
+        # Subcommand routing
         first_word = args.strip().split()[0].lower() if args.strip() else ""
+        if first_word == "setup":
+            await self._setup_lfg(ctx)
+            return
         if first_word == "list":
             await self.lfglist(ctx)
             return
@@ -518,7 +612,7 @@ class LfgCog(Cog):
             return
 
         guild_id = str(ctx.guild.id if hasattr(ctx.guild, 'id') else ctx.guild_id)
-        guild_lfg_url = f"{QL_BASE}/ql/fluxer/{guild_id}/lfg/"
+        guild_lfg_url = f"{QL_BASE}/ql/fluxer/{guild_id}/lfg/browse/"
 
         fluxer_user_id = str(ctx.author.id)
         web_user_id, web_username = _get_web_user_by_fluxer_id(fluxer_user_id)
@@ -585,7 +679,7 @@ class LfgCog(Cog):
         if _lfg_cooldown('lfglist', str(ctx.author.id)):
             return
         guild_id = str(ctx.guild.id if ctx.guild and hasattr(ctx.guild, 'id') else (ctx.guild_id or ''))
-        guild_lfg_url = f"{QL_BASE}/ql/fluxer/{guild_id}/lfg/" if guild_id else QUESTLOG_LFG_URL
+        guild_lfg_url = f"{QL_BASE}/ql/fluxer/{guild_id}/lfg/browse/" if guild_id else QUESTLOG_LFG_URL
 
         try:
             with db_session_scope() as db:
@@ -658,7 +752,7 @@ class LfgCog(Cog):
 
         group_id = int(arg)
         guild_id = str(ctx.guild.id if ctx.guild and hasattr(ctx.guild, 'id') else (ctx.guild_id or ''))
-        group_url = f"{QL_BASE}/ql/fluxer/{guild_id}/lfg/" if guild_id else QUESTLOG_LFG_URL
+        group_url = f"{QL_BASE}/ql/fluxer/{guild_id}/lfg/browse/" if guild_id else QUESTLOG_LFG_URL
 
         fluxer_user_id = str(ctx.author.id)
         web_user_id, web_username = _get_web_user_by_fluxer_id(fluxer_user_id)
@@ -730,6 +824,7 @@ class LfgCog(Cog):
         guild_name = ctx.guild.name or "Unknown Server"
         channel_id = str(ctx.channel.id)
         channel_name = getattr(ctx.channel, "name", None) or channel_id
+        dashboard_url = f"{QL_BASE}/ql/dashboard/fluxer/{guild_id}/"
 
         try:
             with db_session_scope() as db:

@@ -94,86 +94,126 @@ def _twitch_get_avatar(handle: str, client_id: str, client_secret: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# YouTube helpers (API key only - checks for active live broadcasts)
+# YouTube helpers (no API key required - scrapes /live page)
 # ---------------------------------------------------------------------------
 
-def _youtube_check_live(handle: str, api_key: str) -> dict | None:
+_YT_HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+    'Accept-Language': 'en-US,en;q=0.9',
+}
+
+
+def _youtube_resolve_channel_url(handle: str) -> str:
     """
-    Return stream info dict if the YouTube channel `handle` has an active live broadcast.
-    `handle` can be a channel ID (UC...) or a @handle / plain username.
-    Returns None if offline or not found.
+    Convert a handle/channel-ID to the canonical /channel/UC... URL path.
+    Returns empty string if unresolvable.
+    No API key required.
     """
-    # Resolve channel ID if needed
-    channel_id = _youtube_resolve_channel(handle, api_key)
-    if not channel_id:
-        return None
-
-    # Search for active live broadcasts on this channel
-    resp = requests.get(
-        'https://www.googleapis.com/youtube/v3/search',
-        params={
-            'part': 'snippet',
-            'channelId': channel_id,
-            'eventType': 'live',
-            'type': 'video',
-            'key': api_key,
-        },
-        timeout=10,
-    )
-    resp.raise_for_status()
-    items = resp.json().get('items', [])
-    if not items:
-        return None
-    item = items[0]
-    snippet = item.get('snippet', {})
-    video_id = item.get('id', {}).get('videoId', '')
-    thumbnails = snippet.get('thumbnails', {})
-    thumb = (thumbnails.get('medium') or thumbnails.get('default') or {}).get('url', '')
-    return {
-        'title': snippet.get('title', ''),
-        'viewer_count': 0,  # requires videos.list liveBroadcasts part
-        'game_name': '',
-        'thumbnail_url': thumb,
-        'stream_url': f"https://youtube.com/watch?v={video_id}" if video_id else f"https://youtube.com/channel/{channel_id}",
-        'channel_id': channel_id,
-        'avatar_url': '',
-    }
-
-
-def _youtube_resolve_channel(handle: str, api_key: str) -> str:
-    """Resolve a YouTube handle/@handle/channel ID to a channel ID string."""
+    import re
+    clean = handle.lstrip('@')
     # Already a channel ID
-    if handle.startswith('UC') and len(handle) > 20:
-        return handle
-    # @handle - use forHandle param
-    search_handle = handle.lstrip('@')
+    if clean.startswith('UC') and len(clean) > 20:
+        return f'/channel/{clean}'
+    # It's a @handle - scrape the handle page to get the channel ID
     try:
         resp = requests.get(
-            'https://www.googleapis.com/youtube/v3/channels',
-            params={'part': 'id', 'forHandle': search_handle, 'key': api_key},
-            timeout=8,
+            f'https://www.youtube.com/@{clean}',
+            headers=_YT_HEADERS,
+            timeout=12,
         )
-        resp.raise_for_status()
-        items = resp.json().get('items', [])
-        if items:
-            return items[0]['id']
-    except Exception:
-        pass
-    # Fall back to search
-    try:
-        resp = requests.get(
-            'https://www.googleapis.com/youtube/v3/search',
-            params={'part': 'snippet', 'q': search_handle, 'type': 'channel',
-                    'maxResults': 1, 'key': api_key},
-            timeout=8,
-        )
-        resp.raise_for_status()
-        items = resp.json().get('items', [])
-        if items:
-            return items[0]['id']['channelId']
+        if resp.status_code != 200:
+            return ''
+        # Extract channel ID from page source
+        m = re.search(r'"channelId"\s*:\s*"(UC[A-Za-z0-9_-]{22})"', resp.text)
+        if m:
+            return f'/channel/{m.group(1)}'
+        # Fallback: look for canonical link
+        m2 = re.search(r'channel/(UC[A-Za-z0-9_-]{22})', resp.text)
+        if m2:
+            return f'/channel/{m2.group(1)}'
     except Exception:
         pass
     return ''
+
+
+def _youtube_check_live(handle: str, api_key: str) -> dict | None:
+    """
+    Check if a YouTube channel is currently live by fetching its /live page.
+    No API key or billing required - uses public page scraping.
+    Returns stream info dict if live, None otherwise.
+    """
+    import re, json as _json
+
+    channel_path = _youtube_resolve_channel_url(handle)
+    if not channel_path:
+        logger.warning(f"LiveAlerts: YouTube could not resolve channel for handle '{handle}'")
+        return None
+
+    live_url = f'https://www.youtube.com{channel_path}/live'
+    try:
+        resp = requests.get(live_url, headers=_YT_HEADERS, timeout=12)
+        if resp.status_code != 200:
+            logger.debug(f"LiveAlerts: YouTube /live page returned {resp.status_code} for {handle}")
+            return None
+        html = resp.text
+    except Exception as e:
+        logger.warning(f"LiveAlerts: YouTube /live fetch failed for {handle}: {e}")
+        return None
+
+    # Extract ytInitialData JSON blob
+    m = re.search(r'var ytInitialData\s*=\s*(\{.*?\});\s*</script>', html, re.DOTALL)
+    if not m:
+        # Channel is not live (YouTube redirects or shows "no live stream" page)
+        return None
+
+    try:
+        yt_data = _json.loads(m.group(1))
+    except Exception:
+        return None
+
+    # Walk the data to find videoDetails with isLive or isLiveContent
+    raw = _json.dumps(yt_data)
+
+    # Quick check: if "isLive":true not present anywhere, not live
+    if '"isLive":true' not in raw and '"isLiveContent":true' not in raw:
+        return None
+
+    # Extract video ID from the page
+    video_id = ''
+    vid_m = re.search(r'"videoId"\s*:\s*"([A-Za-z0-9_-]{11})"', raw)
+    if vid_m:
+        video_id = vid_m.group(1)
+
+    # Extract title
+    title = ''
+    title_m = re.search(r'"title"\s*:\s*\{"runs":\[\{"text"\s*:\s*"([^"]+)"', raw)
+    if title_m:
+        title = title_m.group(1)
+    if not title:
+        title_m2 = re.search(r'"title"\s*:\s*"([^"]+)"', raw)
+        if title_m2:
+            title = title_m2.group(1)
+
+    # Extract viewer count
+    viewer_count = 0
+    views_m = re.search(r'"concurrentViewers"\s*:\s*"(\d+)"', raw)
+    if views_m:
+        viewer_count = int(views_m.group(1))
+
+    # Thumbnail from video ID
+    thumbnail_url = f'https://img.youtube.com/vi/{video_id}/maxresdefault.jpg' if video_id else ''
+    stream_url = f'https://youtube.com/watch?v={video_id}' if video_id else f'https://youtube.com{channel_path}/live'
+
+    logger.info(f"LiveAlerts: YouTube {handle} is LIVE - '{title}' ({viewer_count} viewers)")
+    return {
+        'title': title or 'Live Stream',
+        'viewer_count': viewer_count,
+        'game_name': '',
+        'thumbnail_url': thumbnail_url,
+        'stream_url': stream_url,
+        'channel_id': channel_path.replace('/channel/', ''),
+        'avatar_url': '',
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -196,7 +236,7 @@ class LiveAlertsCog(Cog):
         if not self._twitch_client_id or not self._twitch_client_secret:
             logger.warning("LiveAlerts: TWITCH_CLIENT_ID/SECRET not set - Twitch alerts disabled")
         if not self._youtube_api_key:
-            logger.warning("LiveAlerts: YOUTUBE_API_KEY not set - YouTube alerts disabled")
+            logger.info("LiveAlerts: YOUTUBE_API_KEY not set - YouTube live detection uses page scraping (no API key needed)")
 
     @Cog.listener()
     async def on_ready(self):
@@ -259,10 +299,10 @@ class LiveAlertsCog(Cog):
                 logger.warning(f"LiveAlerts: Twitch check failed for {handle}: {e}")
                 return
 
-        elif platform == 'youtube' and self._youtube_api_key:
+        elif platform == 'youtube':
             try:
                 stream_info = await loop.run_in_executor(
-                    None, _youtube_check_live, handle, self._youtube_api_key
+                    None, _youtube_check_live, handle, ''
                 )
             except Exception as e:
                 logger.warning(f"LiveAlerts: YouTube check failed for {handle}: {e}")

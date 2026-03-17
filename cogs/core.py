@@ -302,6 +302,18 @@ class CoreCog(Cog):
         icon = getattr(guild, 'icon', None)
         guild_icon_hash = str(icon) if icon else None
 
+        # owner_id may be absent from GUILD_CREATE payload in Fluxer SDK - fetch via HTTP
+        if not owner_id:
+            try:
+                guild_data = await self.bot._http.get_guild(guild_id)
+                owner_id = str(guild_data.get('owner_id', '') or '')
+                if not guild_name:
+                    guild_name = guild_data.get('name', '') or ''
+                if not guild_icon_hash:
+                    guild_icon_hash = guild_data.get('icon') or None
+            except Exception as e:
+                logger.warning(f"Could not fetch guild {guild_id} via HTTP for owner_id: {e}")
+
         # Member counts
         member_count = getattr(guild, 'member_count', 0) or 0
         # online_count is not reliably available without presence intent - send 0

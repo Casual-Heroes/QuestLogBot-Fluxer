@@ -18,6 +18,8 @@ from cogs.discovery import DiscoveryCog
 from cogs.rss import RssCog
 from cogs.trackers import TrackersCog
 from cogs.live_alerts import LiveAlertsCog
+from cogs.creators import CreatorsCog
+from cogs.audit import AuditCog
 
 intents = fluxer.Intents.default()
 
@@ -46,6 +48,8 @@ async def main():
     await bot.add_cog(RssCog(bot))
     await bot.add_cog(TrackersCog(bot))
     await bot.add_cog(LiveAlertsCog(bot))
+    await bot.add_cog(CreatorsCog(bot))
+    await bot.add_cog(AuditCog(bot))
     logger.info("Starting QuestLog Fluxer Bot...")
     await bot.start(token)
 

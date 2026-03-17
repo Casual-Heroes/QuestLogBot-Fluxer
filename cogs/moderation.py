@@ -192,7 +192,7 @@ class ModerationCog(Cog):
         reason = " ".join(args[2:]) or "No reason provided"
         guild_id = str(ctx.guild.id)
         until = (
-            datetime.datetime.utcnow() + datetime.timedelta(minutes=minutes)
+            datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(minutes=minutes)
         ).strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
         try:

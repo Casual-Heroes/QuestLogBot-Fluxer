@@ -302,7 +302,8 @@ class BridgeCog(Cog):
             if not channel_id_str or (not content and not attachments):
                 continue
 
-            if reply_quote:
+            # Only include the blockquote if we can't do a native reply
+            if reply_quote and not reply_to_event_id:
                 formatted = f"> {reply_quote}\n**[{tag}] {author}:** {content}"
             else:
                 formatted = f"**[{tag}] {author}:** {content}".rstrip()

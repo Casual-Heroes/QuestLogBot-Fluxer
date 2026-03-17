@@ -288,8 +288,13 @@ MEDALS = {1: "🥇", 2: "🥈", 3: "🥉"}
 
 
 def _xp_to_level(xp: float) -> int:
-    """Simple level formula used for bot-local fluxer_member_xp.level column."""
-    return int(xp ** 0.5) // 5
+    """Calculate level from XP using the same formula as the site and WardenBot: 7*(level+1)^1.5"""
+    level = 1
+    while level < 99:
+        if int(xp) < int(7 * ((level + 1) ** 1.5)):
+            break
+        level += 1
+    return level
 
 
 def _xp_bar(xp: float, level: int) -> str:
