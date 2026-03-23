@@ -484,21 +484,25 @@ class XpCog(Cog):
         try:
             with db_session_scope() as db:
                 now = int(time.time())
-                # Fetch old level before update
+                # Fetch current XP + level so we can compute the new level in Python
+                # using the correct formula (7*(level+1)^1.5) - never let MySQL compute it
                 old_row = db.execute(text(
-                    "SELECT level FROM fluxer_member_xp WHERE guild_id = :g AND user_id = :u"
+                    "SELECT xp, level FROM fluxer_member_xp WHERE guild_id = :g AND user_id = :u"
                 ), {"g": int(guild_id), "u": int(user_id)}).fetchone()
-                old_level = int(old_row[0]) if old_row else -1
+                old_xp = int(old_row[0]) if old_row else 0
+                old_level = int(old_row[1]) if old_row else -1
+                new_total_xp = old_xp + amount
+                new_level = _xp_to_level(new_total_xp)
 
                 db.execute(
                     text(
                         "INSERT INTO fluxer_member_xp "
                         "(guild_id, user_id, username, xp, level, message_count, media_count, reaction_count, voice_minutes, last_message_ts, first_seen, last_active) "
-                        "VALUES (:guild_id, :user_id, :username, :xp, :level, 1, :inc_media, :inc_reaction, :inc_voice, :now, :now, :now) "
+                        "VALUES (:guild_id, :user_id, :username, :xp, :new_level, 1, :inc_media, :inc_reaction, :inc_voice, :now, :now, :now) "
                         "ON DUPLICATE KEY UPDATE "
                         "xp = xp + :xp, "
                         "username = :username, "
-                        "level = FLOOR(SQRT(xp + :xp)) DIV 5, "
+                        "level = :new_level, "
                         "message_count = message_count + 1, "
                         "media_count = media_count + :inc_media, "
                         "reaction_count = reaction_count + :inc_reaction, "
@@ -511,18 +515,13 @@ class XpCog(Cog):
                         "user_id": int(user_id),
                         "username": username,
                         "xp": amount,
-                        "level": _xp_to_level(amount),
+                        "new_level": new_level,
                         "inc_media": inc_media,
                         "inc_reaction": inc_reaction,
                         "inc_voice": inc_voice_minutes,
                         "now": now,
                     },
                 )
-                # Read back new level
-                new_row = db.execute(text(
-                    "SELECT level FROM fluxer_member_xp WHERE guild_id = :g AND user_id = :u"
-                ), {"g": int(guild_id), "u": int(user_id)}).fetchone()
-                new_level = int(new_row[0]) if new_row else 0
                 if new_level > old_level and old_level >= 0:
                     leveled_up = True
 
@@ -585,9 +584,9 @@ class XpCog(Cog):
         try:
             dest = cfg['level_up_destination']
             template = cfg['level_up_message'] or DEFAULT_LEVELUP_MESSAGE
-            display_name = getattr(message.author, 'display_name', None) or getattr(message.author, 'username', 'Member')
-            mention = getattr(message.author, 'mention', display_name)
-            guild_name = getattr(message.guild, 'name', '') if message.guild else ''
+            display_name = getattr(message.author, 'display_name', None) or getattr(message.author, 'username', None) or 'Member'
+            mention = getattr(message.author, 'mention', None) or display_name
+            guild_name = (getattr(message.guild, 'name', None) or '') if message.guild else ''
 
             text_msg = _format_levelup_message(template, display_name, mention, new_level, guild_name)
             embed = fluxer.Embed(
