@@ -1,0 +1,1353 @@
+# cogs/gameserver.py - Unified game server management for QuestLogFluxer
+#
+# Replaces vquest.py, sdtd.py, shroudquest.py, valquest.py with a single
+# data-driven cog. Game servers are auto-discovered from AMP on startup.
+#
+# Architecture:
+#   - On ready: polls AMP for all instances, reads GenericModule.kvp for
+#     log regexes, inserts unknown instances into gamebot_configs as unconfigured
+#   - Per configured instance: starts a LogWatcher, status monitor, daily scheduler
+#   - Commands are generic: !gs_status, !gs_start, !gs_stop, !gs_restart,
+#     !gs_players, !gs_backup -- work for ANY game
+#   - 7DTD-specific: auto zombie spawn, telnet position tracker (preserved)
+#   - No per-game env vars needed - single AMP_USER/AMP_PASSWORD
+
+import asyncio
+import datetime
+import json
+import logging
+import os
+import random
+import re
+import time
+from glob import glob
+from pathlib import Path
+
+import fluxer
+from fluxer import Cog
+from sqlalchemy import text
+
+from config import logger, db_session_scope
+
+# Suppress noisy AMP library connection error logs - we handle them gracefully
+logging.getLogger('ampapi').setLevel(logging.CRITICAL)
+
+# ---- AMP credentials (single account) ----
+AMP_URL      = os.getenv('AMP_URL', '')
+AMP_USER     = os.getenv('AMP_USER', '')
+AMP_PASSWORD = os.getenv('AMP_PASSWORD', '')
+
+# ---- AMP instance base paths (local + remote NFS mounts) ----
+# Primary local path. Additional paths can be added via AMP_INSTANCES_EXTRA
+# as a colon-separated list, e.g. /mnt/remote/serverc/gamestorage1:/mnt/remote/serverb/gamestorage1
+AMP_INSTANCES_BASE = Path(os.getenv('AMP_INSTANCES_BASE', '/mnt/gamestoreage2/ampinstances'))
+_extra_raw = os.getenv('AMP_INSTANCES_EXTRA', '')
+AMP_INSTANCES_PATHS: list[Path] = [AMP_INSTANCES_BASE] + [
+    Path(p.strip()) for p in _extra_raw.split(':') if p.strip()
+]
+
+# ---- 7DTD-specific RCON (preserved from sdtd.py) ----
+RCON_HOST     = os.getenv('RCON_HOST', '')
+RCON_PORT     = int(os.getenv('RCON_PORT', '8081'))
+RCON_PASSWORD = os.getenv('RCON_PASSWORD', '')
+
+# ---- 7DTD position data dir (shared with 7questbot) ----
+_DATA_DIR             = Path(os.getenv('Q7_DATA_DIR', '/mnt/gamestoreage2/DiscordBots/7questbot'))
+PLAYER_POSITIONS_FILE = _DATA_DIR / 'player_positions.json'
+ONLINE_PLAYERS_FILE   = _DATA_DIR / 'online_players.json'
+
+# ---- Game color map ----
+GAME_COLORS = {
+    'V Rising':              0x8B0000,
+    'Seven Days To Die':     0xE8890C,
+    'Enshrouded':            0x7B4EA0,
+    'Valheim':               0x3A7BD5,
+    'Icarus':                0x2E8B57,
+    'Palworld':              0xF4A261,
+    'Palworld (Modded)':     0xF4A261,
+}
+DEFAULT_COLOR = 0x008080
+
+GAME_EMOJIS = {
+    'V Rising':              '🩸',
+    'Seven Days To Die':     '🧟',
+    'Enshrouded':            '🌫️',
+    'Valheim':               '⚔️',
+    'Icarus':                '🪐',
+    'Palworld':              '🐾',
+    'Palworld (Modded)':     '🐾',
+}
+DEFAULT_EMOJI = '🎮'
+
+SDTD_SPAWN_RADIUS = 15
+
+# ---------------------------------------------------------------------------
+# Log Watcher - reads AMP_Logs/*.log files per instance (no env var needed)
+# ---------------------------------------------------------------------------
+
+class LogWatcher:
+    """Tails the latest AMPLOG *.log file in the given directory."""
+
+    def __init__(self, log_dir: str):
+        self.log_dir = log_dir
+        self.glob_pattern = os.path.join(log_dir, 'AMPLOG *.log')
+        self.current_file: str | None = None
+        self.file_handle = None
+        self.file_position: int = 0
+        self._update_latest()
+
+    def _update_latest(self):
+        files = sorted(glob(self.glob_pattern))
+        if not files:
+            return
+        latest = files[-1]
+        if latest != self.current_file:
+            if self.file_handle:
+                self.file_handle.close()
+            self.current_file = latest
+            self.file_handle = open(latest, 'rb')
+            # Seek to end on first open so we only read NEW lines
+            self.file_handle.seek(0, 2)
+            self.file_position = self.file_handle.tell()
+
+    def read_new_lines(self) -> list[str]:
+        self._update_latest()
+        if not self.file_handle:
+            return []
+        self.file_handle.seek(self.file_position)
+        raw = self.file_handle.readlines()
+        self.file_position = self.file_handle.tell()
+        lines = []
+        for l in raw:
+            try:
+                lines.append(l.decode('utf-8', errors='replace').strip())
+            except Exception:
+                pass
+        return [l for l in lines if l]
+
+    def close(self):
+        if self.file_handle:
+            self.file_handle.close()
+            self.file_handle = None
+
+
+# ---------------------------------------------------------------------------
+# KVP reader - extracts join/leave regex from AMP GenericModule.kvp
+# ---------------------------------------------------------------------------
+
+# Lines to suppress from live log - AMP internal noise generated by our own polling
+_LIVE_LOG_BLOCKLIST = [
+    'Authentication attempt for user SVC-AMP-SITEOPS',
+    'Authentication success',
+    'Authentication attempt for user SVC-AMP',
+]
+
+def _filter_live_log_lines(lines: list[str]) -> list[str]:
+    """Filter out AMP internal noise, return only meaningful game server output."""
+    out = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        if any(blocked in line for blocked in _LIVE_LOG_BLOCKLIST):
+            continue
+        out.append(line)
+    return out
+
+
+def _fix_regex(pattern: str) -> str:
+    """Convert .NET/PCRE named groups (?<name>...) to Python syntax (?P<name>...).
+    Duplicate named groups in | alternation become unnamed groups since Python
+    re does not allow redefinition of a group name.
+    """
+    import re as _re
+    converted = _re.sub(r'\(\?<([^>]+)>', r'(?P<\1>', pattern)
+    seen: set = set()
+    def _dedup(m):
+        name = m.group(1)
+        if name in seen:
+            return '(?:'
+        seen.add(name)
+        return m.group(0)
+    return _re.sub(r'\(\?P<([^>]+)>', _dedup, converted)
+
+
+def read_kvp(instance_name: str) -> dict:
+    """Read GenericModule.kvp for an AMP instance. Returns dict of key->value.
+    Also parses App.AppSettings JSON and sets 'server_password' from the
+    game-specific password field (Password / ServerPassword)."""
+    instance_base = next(
+        (p / instance_name for p in AMP_INSTANCES_PATHS if (p / instance_name).exists()),
+        AMP_INSTANCES_BASE / instance_name
+    )
+    kvp_path = instance_base / 'GenericModule.kvp'
+    result = {}
+    try:
+        if not kvp_path.exists():
+            return result
+    except PermissionError:
+        logger.warning(f'read_kvp: permission denied on {kvp_path} - fix with: sudo chmod o+rx {kvp_path.parent}')
+        return result
+    try:
+        text = kvp_path.read_text(errors='replace')
+    except PermissionError:
+        logger.warning(f'read_kvp: permission denied reading {kvp_path}')
+        return result
+    for line in text.splitlines():
+        if '=' in line:
+            k, _, v = line.partition('=')
+            k = k.strip()
+            v = v.strip()
+            # Translate .NET named group syntax to Python for regex fields
+            if k in ('Console.UserJoinRegex', 'Console.UserLeaveRegex'):
+                v = _fix_regex(v)
+            result[k] = v
+    # Extract server password from App.AppSettings JSON
+    app_settings_raw = result.get('App.AppSettings', '')
+    if app_settings_raw:
+        try:
+            app_settings = json.loads(app_settings_raw)
+            # Different games use different key names
+            pw = app_settings.get('Password') or app_settings.get('ServerPassword') or ''
+            result['server_password'] = pw.strip()
+        except (json.JSONDecodeError, AttributeError):
+            pass
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Game-specific config readers
+# ---------------------------------------------------------------------------
+
+def read_ingame_server_name(instance_name: str, game_type: str) -> str | None:
+    """Auto-discover and read the in-game server name from the game's config file.
+
+    Tries common config file patterns and property/key names used across games.
+    No per-game registration needed - works for any game AMP supports.
+
+    Supported formats:
+      - XML:  <property name="ServerName" value="..." />  (7DTD, Valheim-style)
+              <ServerName>...</ServerName>                (direct element)
+      - INI:  ServerName=...  or  server_name=...        (many survival games)
+      - JSON: {"ServerName": "...", "Name": "..."}       (some modern games)
+    """
+    import xml.etree.ElementTree as ET
+    import configparser
+
+    instance_dir = next(
+        (p / instance_name for p in AMP_INSTANCES_PATHS if (p / instance_name).exists()),
+        None
+    )
+    if not instance_dir:
+        return None
+
+    # Common config file names to search for, in priority order
+    config_globs = [
+        '**/serverconfig.xml',
+        '**/server_config.xml',
+        '**/GameUserSettings.ini',
+        '**/serverconfig.ini',
+        '**/server.cfg',
+        '**/server.properties',
+        '**/settings.json',
+        '**/config.json',
+    ]
+
+    # Common property names for server name across games, in priority order
+    name_keys = ['ServerName', 'server_name', 'Name', 'hostname', 'ServerHostName', 'DisplayName']
+
+    for glob_pattern in config_globs:
+        matches = sorted(instance_dir.glob(glob_pattern))
+        if not matches:
+            continue
+        config_file = matches[0]
+        ext = config_file.suffix.lower()
+        try:
+            if ext == '.xml':
+                tree = ET.parse(config_file)
+                root = tree.getroot()
+                # Try <property name="ServerName" value="..." />
+                for key in name_keys:
+                    for elem in root.iter('property'):
+                        if elem.get('name', '').lower() == key.lower():
+                            val = elem.get('value', '').strip()
+                            if val:
+                                return val
+                # Try <ServerName>value</ServerName>
+                for key in name_keys:
+                    elem = root.find(f'.//{key}')
+                    if elem is not None and elem.text and elem.text.strip():
+                        return elem.text.strip()
+
+            elif ext in ('.ini', '.cfg', '.properties'):
+                content = config_file.read_text(errors='replace')
+                # Try configparser first
+                parser = configparser.RawConfigParser()
+                try:
+                    parser.read_string('[root]\n' + content)
+                    for key in name_keys:
+                        try:
+                            val = parser.get('root', key).strip().strip('"\'')
+                            if val:
+                                return val
+                        except configparser.NoOptionError:
+                            pass
+                except Exception:
+                    pass
+                # Fallback: line-by-line key=value scan
+                for line in content.splitlines():
+                    for key in name_keys:
+                        if line.strip().lower().startswith(key.lower() + '='):
+                            val = line.split('=', 1)[1].strip().strip('"\'')
+                            if val:
+                                return val
+
+            elif ext == '.json':
+                data = json.loads(config_file.read_text(errors='replace'))
+                if isinstance(data, dict):
+                    for key in name_keys:
+                        val = data.get(key, '')
+                        if val and isinstance(val, str):
+                            return val.strip()
+
+        except Exception:
+            continue
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# AMP helpers
+# ---------------------------------------------------------------------------
+
+async def _get_amp_instance(instance_name: str):
+    """Connect to AMP and return the named instance (single account)."""
+    if not AMP_URL or not AMP_USER or not AMP_PASSWORD:
+        logger.warning('AMP credentials not configured')
+        return None
+    try:
+        from ampapi.dataclass import APIParams
+        from ampapi.bridge import Bridge
+        from ampapi.controller import AMPControllerInstance as _AMPCtrl
+
+        params = APIParams(url=AMP_URL, user=AMP_USER, password=AMP_PASSWORD)
+        Bridge(api_params=params)
+        ctrl = _AMPCtrl()
+        await ctrl.get_instances()
+        instance = next(
+            (i for i in ctrl.instances if i.instance_name == instance_name),
+            None
+        )
+        return instance
+    except Exception as e:
+        logger.error(f'AMP connect failed for {instance_name}: {e}')
+        return None
+
+
+async def _get_all_amp_instances() -> list:
+    """Return all AMP instances visible to the single admin account."""
+    if not AMP_URL or not AMP_USER or not AMP_PASSWORD:
+        return []
+    try:
+        from ampapi.dataclass import APIParams
+        from ampapi.bridge import Bridge
+        from ampapi.controller import AMPControllerInstance as _AMPCtrl
+
+        params = APIParams(url=AMP_URL, user=AMP_USER, password=AMP_PASSWORD)
+        Bridge(api_params=params)
+        ctrl = _AMPCtrl()
+        await ctrl.get_instances()
+        # Filter out ADS controller itself
+        return [i for i in ctrl.instances if getattr(i, 'module', '') != 'ADS']
+    except Exception as e:
+        logger.error(f'AMP get_instances failed: {e}')
+        return []
+
+
+async def _get_server_status(instance_name: str, public_ip: str | None = None) -> dict:
+    """Return status dict for an instance."""
+    result = {
+        'state': 'Unknown', 'is_running': False, 'uptime': None,
+        'cpu': None, 'ram_mb': None, 'ram_max_mb': None,
+        'player_count': 0, 'player_max': 0, 'ip': None, 'port': None,
+    }
+    instance = await _get_amp_instance(instance_name)
+    if not instance:
+        return result
+    try:
+        status = await instance.get_status(format_data=False)
+        # API returns lowercase snake_case keys with raw_value/max_value/percent
+        metrics = status.get('metrics', {})
+        result['uptime'] = status.get('uptime')
+        result['state'] = status.get('state', 'Unknown')
+        state_str = str(result['state']).strip()
+        result['is_running'] = state_str in ('Running', '5', '20') or 'running' in state_str.lower()
+        cpu_m = metrics.get('cpu_usage', {})
+        result['cpu'] = round(cpu_m.get('percent', 0), 1) if cpu_m else None
+        ram_m = metrics.get('memory_usage', {})
+        if ram_m:
+            result['ram_mb'] = ram_m.get('raw_value', 0)
+            result['ram_max_mb'] = ram_m.get('max_value', 0)
+        users_m = metrics.get('active_users', {})
+        if users_m:
+            result['player_count'] = int(users_m.get('raw_value', 0))
+            result['player_max'] = int(users_m.get('max_value', 0))
+    except Exception:
+        pass  # Instance offline or unreachable - result stays at defaults (is_running=False)
+    try:
+        import requests as _requests
+        ports = await instance.get_port_summaries(format_data=False)
+        # Exclude management/infra ports that are never the game connect port
+        _excluded = ('sftp', 'control panel', 'telnet', 'allocs', 'webserver', 'metrics')
+        valid_ports = [
+            p for p in (ports or [])
+            if not p.get('internalonly', False)
+            and p.get('port') is not None
+            and not any(ex in p.get('name', '').lower() for ex in _excluded)
+        ]
+        preferred_names = [
+            'server and steam port', 'game and mods port', 'game port',
+            'server port', 'query port',
+        ]
+        game_port = next(
+            (p for name in preferred_names for p in valid_ports
+             if name in p.get('name', '').lower()),
+            None
+        )
+        if not game_port and valid_ports:
+            game_port = valid_ports[0]
+        if game_port:
+            raw_ip = (
+                game_port.get('ip') or game_port.get('hostname')
+                or game_port.get('address') or game_port.get('Address')
+            )
+            # AMP returns 0.0.0.0 when the server is binding all interfaces - use public_ip
+            # override from DB if set, otherwise fall back to ifconfig.me (bot's own IP)
+            if not raw_ip or raw_ip in ('0.0.0.0', '::'):
+                if public_ip:
+                    raw_ip = public_ip
+                else:
+                    try:
+                        raw_ip = _requests.get('https://ifconfig.me', timeout=5).text.strip()
+                    except Exception:
+                        raw_ip = None
+            result['ip']   = raw_ip
+            result['port'] = str(game_port.get('port', ''))
+    except Exception:
+        pass  # Instance offline - no port info available
+    return result
+
+
+# ---------------------------------------------------------------------------
+# DB helpers (unified table)
+# ---------------------------------------------------------------------------
+
+def _load_all_configs() -> list[dict]:
+    try:
+        with db_session_scope() as db:
+            rows = db.execute(text(
+                "SELECT * FROM gamebot_configs WHERE configured = 1 AND guild_id IS NOT NULL"
+            )).fetchall()
+            return [dict(r._mapping) for r in rows]
+    except Exception as e:
+        logger.error(f'_load_all_configs: {e}')
+        return []
+
+
+def _load_config(instance_name: str) -> dict | None:
+    try:
+        with db_session_scope() as db:
+            row = db.execute(text(
+                "SELECT * FROM gamebot_configs WHERE instance_name = :n LIMIT 1"
+            ), {'n': instance_name}).fetchone()
+            return dict(row._mapping) if row else None
+    except Exception as e:
+        logger.error(f'_load_config {instance_name}: {e}')
+        return None
+
+
+async def _has_permission(cfg: dict, ctx) -> bool:
+    """Check if ctx.author can run admin game server commands.
+    Delegates to is_bot_manager: owner > Administrator > Manage Messages > Bot Manager role.
+    """
+    from cogs.permissions import is_bot_manager
+    return await is_bot_manager(ctx, cfg)
+
+
+def _upsert_player(instance_name: str, guild_id: str, userid: str | None, username: str):
+    try:
+        with db_session_scope() as db:
+            db.execute(text("""
+                INSERT INTO gamebot_players (instance_name, guild_id, userid, username)
+                VALUES (:inst, :g, :uid, :name)
+                ON DUPLICATE KEY UPDATE username=VALUES(username), last_seen=NOW()
+            """), {'inst': instance_name, 'g': guild_id, 'uid': userid or '', 'name': username})
+    except Exception as e:
+        logger.error(f'_upsert_player: {e}')
+
+
+def _remove_player(instance_name: str, userid: str | None, username: str | None):
+    """Remove player by userid OR username - tries both so stale IDs don't block removal."""
+    try:
+        with db_session_scope() as db:
+            if userid:
+                db.execute(text(
+                    "DELETE FROM gamebot_players WHERE instance_name=:inst AND userid=:uid"
+                ), {'inst': instance_name, 'uid': userid})
+            if username:
+                db.execute(text(
+                    "DELETE FROM gamebot_players WHERE instance_name=:inst AND username=:name"
+                ), {'inst': instance_name, 'name': username})
+    except Exception as e:
+        logger.error(f'_remove_player: {e}')
+
+
+def _lookup_username_by_userid(instance_name: str, userid: str) -> str | None:
+    """Look up a character name by Steam/user ID - used when leave log only gives userid."""
+    try:
+        with db_session_scope() as db:
+            row = db.execute(text(
+                "SELECT username FROM gamebot_players WHERE instance_name=:inst AND userid=:uid LIMIT 1"
+            ), {'inst': instance_name, 'uid': userid}).fetchone()
+            return row.username if row else None
+    except Exception:
+        return None
+
+
+def _get_online_players(instance_name: str) -> list[str]:
+    try:
+        with db_session_scope() as db:
+            rows = db.execute(text(
+                "SELECT username FROM gamebot_players WHERE instance_name=:inst ORDER BY joined_at"
+            ), {'inst': instance_name}).fetchall()
+            return [r.username for r in rows]
+    except Exception:
+        return []
+
+
+def _update_serverinfo_id(instance_name: str, msg_id: str | None):
+    try:
+        with db_session_scope() as db:
+            db.execute(text(
+                "UPDATE gamebot_configs SET serverinfo_message_id=:mid WHERE instance_name=:n"
+            ), {'mid': msg_id, 'n': instance_name})
+    except Exception as e:
+        logger.error(f'_update_serverinfo_id: {e}')
+
+
+# ---------------------------------------------------------------------------
+# Auto-discovery: poll AMP, register unknown instances in DB
+# ---------------------------------------------------------------------------
+
+async def discover_instances():
+    """Poll AMP and upsert any new instances into gamebot_configs as unconfigured."""
+    instances = await _get_all_amp_instances()
+    if not instances:
+        logger.warning('AMP discovery: no instances returned (check AMP credentials)')
+        return
+
+    for inst in instances:
+        name = getattr(inst, 'instance_name', None)
+        if not name:
+            continue
+
+        # Read from KVP
+        kvp = read_kvp(name)
+        join_regex   = kvp.get('Console.UserJoinRegex')
+        leave_regex  = kvp.get('Console.UserLeaveRegex')
+        display_name = getattr(inst, 'friendly_name', None) or kvp.get('Meta.DisplayName') or name
+        instance_base = next(
+            (p / name for p in AMP_INSTANCES_PATHS if (p / name).exists()),
+            AMP_INSTANCES_BASE / name
+        )
+        amp_log_dir  = str(instance_base / 'AMP_Logs')
+        server_pw    = kvp.get('server_password') or ''
+
+        # game_type from AMP module_display_name or Meta.DisplayName
+        game_type = (
+            getattr(inst, 'module_display_name', None)
+            or display_name
+            or 'Unknown'
+        )
+
+        try:
+            with db_session_scope() as db:
+                db.execute(text("""
+                    INSERT INTO gamebot_configs
+                        (instance_name, instance_id, game_type, amp_log_dir,
+                         join_regex, leave_regex, server_display_name, server_password, configured)
+                    VALUES
+                        (:name, :iid, :gtype, :logdir,
+                         :jrx, :lrx, :dname, :pw, 0)
+                    ON DUPLICATE KEY UPDATE
+                        instance_id          = COALESCE(instance_id, VALUES(instance_id)),
+                        game_type            = VALUES(game_type),
+                        amp_log_dir          = VALUES(amp_log_dir),
+                        join_regex           = VALUES(join_regex),
+                        leave_regex          = VALUES(leave_regex),
+                        server_display_name  = VALUES(server_display_name),
+                        server_password      = VALUES(server_password)
+                """), {
+                    'name':   name,
+                    'iid':    getattr(inst, 'instance_id', None),
+                    'gtype':  game_type,
+                    'logdir': amp_log_dir,
+                    'jrx':    join_regex,
+                    'lrx':    leave_regex,
+                    'dname':  display_name,
+                    'pw':     server_pw,
+                })
+            logger.info(f'AMP discovery: registered {name} ({game_type}), password={"set" if server_pw else "none"}')
+        except Exception as e:
+            logger.error(f'AMP discovery upsert failed for {name}: {e}')
+
+    # Remove DB records for instances that no longer exist in AMP
+    amp_names = [getattr(i, 'instance_name', None) for i in instances]
+    amp_names = [n for n in amp_names if n]
+    if amp_names:
+        try:
+            placeholders = ','.join([':n' + str(i) for i in range(len(amp_names))])
+            params = {'n' + str(i): n for i, n in enumerate(amp_names)}
+            with db_session_scope() as db:
+                result = db.execute(text(f"""
+                    DELETE FROM gamebot_configs
+                    WHERE instance_name NOT IN ({placeholders})
+                """), params)
+                if result.rowcount:
+                    logger.info(f'AMP discovery: removed {result.rowcount} stale instance(s) from DB')
+        except Exception as e:
+            logger.error(f'AMP discovery cleanup failed: {e}')
+
+
+# ---------------------------------------------------------------------------
+# Embed builder (generic, works for any game)
+# ---------------------------------------------------------------------------
+
+async def build_serverinfo_embed(cfg: dict) -> fluxer.Embed:
+    instance_name = cfg['instance_name']
+    game_type     = cfg.get('game_type', 'Game Server')
+    display_name  = cfg.get('server_display_name') or game_type
+    color         = GAME_COLORS.get(game_type, DEFAULT_COLOR)
+    game_emoji    = GAME_EMOJIS.get(game_type, DEFAULT_EMOJI)
+
+    status  = await _get_server_status(instance_name, public_ip=cfg.get('public_ip') or None)
+    players = _get_online_players(instance_name)
+
+    is_running  = status['is_running']
+    state_emoji = '🟢' if is_running else '🔴'
+    state_label = 'Online' if is_running else 'Offline'
+
+    embed = fluxer.Embed(
+        title=f'{game_emoji} {display_name} Server Info',
+        color=color,
+    )
+
+    # Row 1: Status + Players (player count respects toggle)
+    embed.add_field(name='Server Status', value=f'{state_emoji} {state_label}', inline=True)
+    if cfg.get('show_player_count', True):
+        player_count = status['player_count'] or len(players)
+        player_max   = status['player_max'] or 0
+        pc_str = f"{player_count}/{player_max}" if player_max else str(player_count)
+        embed.add_field(name='Players', value=pc_str, inline=True)
+
+    # Row 2: In-game server name (from game config file) or fallback to display name
+    ingame_name = read_ingame_server_name(instance_name, game_type)
+    embed.add_field(name='Server Name', value=f"```{ingame_name or display_name}```", inline=False)
+
+    # Connect info - respects show_ip_port toggle
+    if cfg.get('show_ip_port', True) and status.get('ip'):
+        connect = f"{status['ip']}:{status['port']}" if status.get('port') else status['ip']
+        embed.add_field(name='IP Address', value=f"```{connect}```", inline=False)
+
+    # Password (if toggled on)
+    if cfg.get('show_password') and cfg.get('server_password'):
+        embed.add_field(name='Server Password', value=f"```{cfg['server_password']}```", inline=False)
+
+    # Stats: CPU / RAM / Uptime
+    if status['cpu'] is not None:
+        embed.add_field(name='CPU Usage', value=f"{status['cpu']}%", inline=True)
+    if status['ram_mb'] is not None:
+        embed.add_field(name='Memory Usage', value=f"{int(status['ram_mb'])} MB", inline=True)
+    if status['uptime']:
+        embed.add_field(name='Uptime', value=str(status['uptime']), inline=True)
+
+    # Online players / top players by playtime - respects show_top_5_players toggle
+    if cfg.get('show_top_5_players', True):
+        if players:
+            lines_out = []
+            char_count = 0
+            for i, name in enumerate(players, 1):
+                line = f"{i}. {name}"
+                if char_count + len(line) + 1 > 1000:
+                    lines_out.append(f'... and {len(players) - i + 1} more')
+                    break
+                lines_out.append(line)
+                char_count += len(line) + 1
+            embed.add_field(name=f'Currently Online ({len(players)})', value='\n'.join(lines_out), inline=False)
+        else:
+            # No one online - show top players by playtime from AMP analytics
+            top_players = []
+            try:
+                instance = await _get_amp_instance(instance_name)
+                if instance:
+                    summary = await instance.get_analytics_summary(period_days=30)
+                    top_players = getattr(summary, 'top_players', [])
+            except Exception:
+                pass
+            if top_players:
+                tp_lines = '\n'.join(
+                    f"{i}. {p.username}  {p.display_session_time}"
+                    for i, p in enumerate(top_players[:10], 1)
+                    if getattr(p, 'username', '').strip()
+                )
+                if tp_lines:
+                    embed.add_field(name='Top Players by Playtime (30d)', value=tp_lines, inline=False)
+            elif is_running:
+                embed.add_field(name='Currently Online', value='No players online.', inline=False)
+
+    embed.set_footer(text=f'Powered by QuestLog - Casual Heroes')
+    embed.timestamp = datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%S.000Z')
+    return embed
+
+
+# ---------------------------------------------------------------------------
+# 7DTD-specific: auto zombie spawner (preserved from sdtd.py)
+# ---------------------------------------------------------------------------
+
+COMMON_ZOMBIES = [
+    'zombieBiker', 'zombieNurse', 'zombieBurnt', 'zombieSpiderFeral',
+    'zombieJanitorFeral', 'zombieMarlene', 'zombieArlene',
+]
+FACTIONS = {
+    'feral_strike':    ['zombieSpiderFeral', 'zombieJanitorFeral', 'zombieMarlene'],
+    'radiated_wave':   ['zombieYoRadiated', 'zombieNurseRadiated', 'zombieSkateboarderFeral'],
+    'hazmat_response': ['zombieSoldier', 'zombieHazmat', 'zombieLab'],
+}
+
+def _calculate_spawn_count(player_count: int) -> int:
+    if player_count <= 1:  return random.randint(1, 2)
+    if player_count <= 3:  return random.randint(2, 4)
+    if player_count <= 5:  return random.randint(3, 5)
+    if player_count <= 10: return random.randint(5, 8)
+    if player_count <= 20: return random.randint(8, 12)
+    return random.randint(12, 20)
+
+def _get_spawn_delay(player_count: int) -> int:
+    if player_count <= 1:  return random.randint(10800, 14400)
+    if player_count <= 3:  return random.randint(5400, 7200)
+    if player_count <= 5:  return random.randint(3600, 5400)
+    if player_count <= 10: return random.randint(1800, 3600)
+    if player_count <= 20: return random.randint(900, 1800)
+    return random.randint(600, 900)
+
+def _load_pos() -> dict:
+    try:
+        if PLAYER_POSITIONS_FILE.exists():
+            return json.loads(PLAYER_POSITIONS_FILE.read_text())
+    except Exception:
+        pass
+    return {}
+
+def _player_online(username: str) -> bool:
+    try:
+        if ONLINE_PLAYERS_FILE.exists():
+            data = json.loads(ONLINE_PLAYERS_FILE.read_text())
+            return any(p.get('name') == username for p in data.get('players', []))
+    except Exception:
+        pass
+    return False
+
+async def _is_blood_moon(instance_name: str) -> bool:
+    try:
+        status = await _get_server_status(instance_name)
+        # blood moon check would require reading game time from logs
+        # preserved as stub
+        return False
+    except Exception:
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Main Cog
+# ---------------------------------------------------------------------------
+
+class GameServerCog(Cog):
+
+    def __init__(self, bot):
+        super().__init__(bot)
+        self._log_watchers: dict[str, LogWatcher] = {}
+        self._spawn_delay_tasks: dict[str, asyncio.Task] = {}
+        self._known_players: dict[str, set] = {}
+
+    # ---- Lifecycle ----
+
+    @Cog.listener()
+    async def on_ready(self):
+        logger.info('GameServerCog: starting auto-discovery and monitors')
+        asyncio.ensure_future(self._discovery_loop())
+        await asyncio.sleep(10)  # Let discovery run first
+        asyncio.ensure_future(self._status_monitor_loop())
+        asyncio.ensure_future(self._log_watcher_loop())
+        asyncio.ensure_future(self._daily_scheduler_loop())
+
+    # ---- Discovery loop ----
+
+    async def _discovery_loop(self):
+        """Poll AMP every 5 minutes and register new instances."""
+        while True:
+            try:
+                await discover_instances()
+            except Exception as e:
+                logger.error(f'discovery_loop error: {e}')
+            await asyncio.sleep(300)
+
+    # ---- Status monitor: rebuilds pinned server info embed every 60s ----
+
+    async def _status_monitor_loop(self):
+        await asyncio.sleep(15)
+        while True:
+            try:
+                configs = _load_all_configs()
+                for cfg in configs:
+                    if not cfg.get('stats_channel_id'):
+                        continue
+                    try:
+                        await self._refresh_serverinfo(cfg)
+                    except Exception as e:
+                        logger.error(f'status_monitor {cfg["instance_name"]}: {e}')
+            except Exception as e:
+                logger.error(f'status_monitor_loop crashed: {e}')
+            await asyncio.sleep(30)
+
+    async def _refresh_serverinfo(self, cfg: dict):
+        instance_name = cfg['instance_name']
+        channel_id    = cfg.get('stats_channel_id')
+        if not channel_id:
+            return
+        embed = await build_serverinfo_embed(cfg)
+        old_msg_id = cfg.get('serverinfo_message_id')
+        # Try to edit existing message so it stays pinned in place
+        if old_msg_id:
+            try:
+                await self.bot._http.edit_message(str(channel_id), str(old_msg_id), embeds=[embed.to_dict()])
+                return
+            except Exception as e:
+                logger.warning(f'[monitor] edit_message failed for {instance_name} msg={old_msg_id}: {e!r}')
+                # Only post a new message if the old one was genuinely not found (404).
+                # For any other error (rate limit, server error) skip this cycle to
+                # avoid creating duplicate embeds.
+                err_str = str(e).lower()
+                if '404' not in err_str and 'unknown message' not in err_str:
+                    logger.debug(f'[monitor] Skipping new post for {instance_name} - non-404 edit failure')
+                    return
+                # 404 / unknown message - clear stored ID so we post fresh next cycle
+                _update_serverinfo_id(instance_name, None)
+                old_msg_id = None
+        # No existing message (or 404 cleared it) - post a new one
+        try:
+            resp = await self.bot._http.send_message(str(channel_id), embeds=[embed])
+            new_id = resp.get('id') if isinstance(resp, dict) else None
+            _update_serverinfo_id(instance_name, new_id)
+        except Exception as e:
+            logger.error(f'[monitor] send_message failed for {instance_name}: {e}')
+
+    # ---- Log watcher loop: one watcher per configured instance ----
+
+    async def _log_watcher_loop(self):
+        await asyncio.sleep(20)
+        while True:
+            configs = _load_all_configs()
+            for cfg in configs:
+                instance_name = cfg['instance_name']
+                log_dir = cfg.get('amp_log_dir', '')
+                try:
+                    log_dir_exists = bool(log_dir) and Path(log_dir).exists()
+                except PermissionError:
+                    logger.warning(f'LogWatcher: permission denied on {log_dir} - fix with: sudo chmod o+rx {log_dir}')
+                    continue
+                if not log_dir_exists:
+                    continue
+                if instance_name not in self._log_watchers:
+                    try:
+                        self._log_watchers[instance_name] = LogWatcher(log_dir)
+                        self._known_players[instance_name] = set()
+                        logger.info(f'LogWatcher started for {instance_name}')
+                    except Exception as e:
+                        logger.error(f'LogWatcher init {instance_name}: {e}')
+                        continue
+                watcher = self._log_watchers[instance_name]
+                try:
+                    lines = watcher.read_new_lines()
+                    if lines:
+                        await self._process_log_lines(lines, cfg)
+                except Exception as e:
+                    logger.error(f'log_watcher_loop {instance_name}: {e}')
+            await asyncio.sleep(3)
+
+    async def _process_log_lines(self, lines: list[str], cfg: dict):
+        instance_name = cfg['instance_name']
+        join_pattern  = cfg.get('join_regex')
+        leave_pattern = cfg.get('leave_regex')
+        guild_id      = cfg.get('guild_id', '')
+        notif_channel = cfg.get('notif_channel_id')
+
+        join_re  = re.compile(join_pattern)  if join_pattern  else None
+        leave_re = re.compile(leave_pattern) if leave_pattern else None
+
+        for line in lines:
+            # --- Join ---
+            if join_re:
+                m = join_re.search(line)
+                if m:
+                    username = (m.groupdict().get('username') or '').strip()
+                    userid   = (m.groupdict().get('userid') or '').strip() or None
+                    if username and username not in self._known_players[instance_name]:
+                        self._known_players[instance_name].add(username)
+                        _upsert_player(instance_name, guild_id, userid, username)
+                        if notif_channel and cfg.get('alert_join_leave'):
+                            color = GAME_COLORS.get(cfg.get('game_type', ''), DEFAULT_COLOR)
+                            embed = fluxer.Embed(
+                                description=f'**{username}** joined **{cfg.get("server_display_name") or cfg["instance_name"]}**',
+                                color=color,
+                            )
+                            try:
+                                await self.bot._http.send_message(str(notif_channel), embeds=[embed])
+                            except Exception as e:
+                                logger.error(f'join notify {instance_name}: {e}')
+                        # 7DTD: cancel spawn delay to trigger sooner when player joins
+                        if '7dtd' in instance_name.lower() or 'sdtd' in instance_name.lower():
+                            t = self._spawn_delay_tasks.get(instance_name)
+                            if t and not t.done():
+                                t.cancel()
+                    continue
+
+            # --- Leave ---
+            if leave_re:
+                m = leave_re.search(line)
+                if m:
+                    username = (m.groupdict().get('username') or '').strip()
+                    userid   = (m.groupdict().get('userid') or '').strip() or None
+                    # If regex has no username group (e.g. V Rising only gives Steam ID on disconnect)
+                    # look up the character name from DB using userid
+                    if not username and userid:
+                        username = _lookup_username_by_userid(instance_name, userid) or ''
+                    if username:
+                        self._known_players[instance_name].discard(username)
+                        _remove_player(instance_name, userid, username)
+                        if notif_channel and cfg.get('alert_join_leave'):
+                            color = GAME_COLORS.get(cfg.get('game_type', ''), DEFAULT_COLOR)
+                            server_name = cfg.get("server_display_name") or cfg["instance_name"]
+                            desc = f'**{username}** left **{server_name}**'
+                            embed = fluxer.Embed(description=desc, color=color)
+                            try:
+                                await self.bot._http.send_message(str(notif_channel), embeds=[embed])
+                            except Exception as e:
+                                logger.error(f'leave notify {instance_name}: {e}')
+
+        # --- Live log forwarding ---
+        live_log_channel = cfg.get('live_log_channel_id')
+        if live_log_channel and cfg.get('alert_live_logs'):
+            filtered = _filter_live_log_lines(lines)
+            if filtered:
+                # Batch into chunks of max 1900 chars to stay under message limit
+                chunk = ''
+                for line in filtered:
+                    if len(chunk) + len(line) + 1 > 1900:
+                        try:
+                            await self.bot._http.send_message(str(live_log_channel), content=f'```\n{chunk}\n```')
+                        except Exception as e:
+                            logger.error(f'live_log send {instance_name}: {e}')
+                        chunk = ''
+                    chunk += line + '\n'
+                if chunk:
+                    try:
+                        await self.bot._http.send_message(str(live_log_channel), content=f'```\n{chunk}\n```')
+                    except Exception as e:
+                        logger.error(f'live_log send {instance_name}: {e}')
+
+    # ---- 7DTD auto zombie spawn ----
+
+    async def _spawn_loop_for_instance(self, cfg: dict):
+        """Auto zombie spawner for 7DTD instances."""
+        instance_name = cfg['instance_name']
+        while True:
+            players = _get_online_players(instance_name)
+            if not players:
+                await asyncio.sleep(60)
+                continue
+            player_count = len(players)
+            try:
+                await self._spawn_zombies(cfg, player_count)
+            except Exception as e:
+                logger.error(f'spawn_loop {instance_name}: {e}')
+            delay = _get_spawn_delay(player_count)
+            try:
+                task = asyncio.ensure_future(asyncio.sleep(delay))
+                self._spawn_delay_tasks[instance_name] = task
+                await task
+            except asyncio.CancelledError:
+                await asyncio.sleep(60)
+
+    async def _spawn_zombies(self, cfg: dict, player_count: int):
+        instance_name = cfg['instance_name']
+        if await _is_blood_moon(instance_name):
+            return
+        positions = _load_pos()
+        if not positions:
+            return
+        players = _get_online_players(instance_name)
+        if not players:
+            return
+        target = random.choice(players)
+        pos_list = positions.get(target, [])
+        if not pos_list:
+            return
+        pos = pos_list[-1]
+        count = _calculate_spawn_count(player_count)
+        hour = datetime.datetime.utcnow().hour
+        is_night = hour >= 20 or hour < 5
+        if is_night:
+            faction = random.choice(list(FACTIONS.keys()))
+            zombie_pool = FACTIONS[faction]
+        else:
+            zombie_pool = COMMON_ZOMBIES
+        instance = await _get_amp_instance(instance_name)
+        if not instance:
+            return
+        for _ in range(count):
+            zombie = random.choice(zombie_pool)
+            ox = random.randint(-SDTD_SPAWN_RADIUS, SDTD_SPAWN_RADIUS)
+            oz = random.randint(-SDTD_SPAWN_RADIUS, SDTD_SPAWN_RADIUS)
+            x = int(pos.get('x', 0)) + ox
+            y = int(pos.get('y', 0))
+            z = int(pos.get('z', 0)) + oz
+            cmd = f'spawnentityat {zombie} {x} {y} {z}'
+            try:
+                await instance.send_console_message(cmd)
+            except Exception as e:
+                logger.error(f'spawn cmd {instance_name}: {e}')
+
+    # ---- Daily scheduler ----
+
+    async def _daily_scheduler_loop(self):
+        await asyncio.sleep(30)
+        _last_settings_run: dict[str, str] = {}
+        _last_backup_run: dict[str, str] = {}
+        while True:
+            configs = _load_all_configs()
+            now = datetime.datetime.now()
+            today_key = now.strftime('%Y-%m-%d')
+            for cfg in configs:
+                instance_name = cfg['instance_name']
+                if not cfg.get('schedule_enabled', 1):
+                    continue
+                sched_h = cfg.get('scheduler_hour', 3)
+                sched_m = cfg.get('scheduler_minute', 27)
+                backup_h = cfg.get('backup_hour', 23)
+                backup_m = cfg.get('backup_minute', 30)
+
+                # Settings run
+                settings_key = f'settings:{instance_name}:{today_key}'
+                if now.hour == sched_h and now.minute == sched_m:
+                    if _last_settings_run.get(settings_key) != today_key:
+                        _last_settings_run[settings_key] = today_key
+                        try:
+                            await self._apply_daily_settings(cfg)
+                        except Exception as e:
+                            logger.error(f'daily_scheduler settings {instance_name}: {e}')
+
+                # Backup run
+                backup_key = f'backup:{instance_name}:{today_key}'
+                if now.hour == backup_h and now.minute == backup_m:
+                    if _last_backup_run.get(backup_key) != today_key:
+                        _last_backup_run[backup_key] = today_key
+                        backup_days = None
+                        raw_bd = cfg.get('backup_days')
+                        if raw_bd:
+                            try:
+                                import json as _json
+                                backup_days = _json.loads(raw_bd)
+                            except Exception:
+                                pass
+                        try:
+                            await self._run_backup(cfg, backup_days=backup_days)
+                        except Exception as e:
+                            logger.error(f'daily_scheduler backup {instance_name}: {e}')
+
+            await asyncio.sleep(60)
+
+    async def _apply_daily_settings(self, cfg: dict):
+        """Apply per-day preset overrides and restart the server."""
+        instance_name = cfg['instance_name']
+        instance = await _get_amp_instance(instance_name)
+        if not instance:
+            return
+        day_name = datetime.datetime.utcnow().strftime('%A')
+        logger.info(f'Daily settings scheduler: {instance_name} - {day_name}')
+
+        overrides = {}
+        raw = cfg.get('schedule_overrides')
+        if raw:
+            try:
+                all_overrides = json.loads(raw)
+                overrides = all_overrides.get(day_name, {})
+            except Exception:
+                pass
+
+        try:
+            await instance.stop_application()
+            await asyncio.sleep(10)
+            for key, value in overrides.items():
+                try:
+                    await instance.set_config(key, value)
+                except Exception as e:
+                    logger.warning(f'set_config {key}: {e}')
+            await asyncio.sleep(5)
+            await instance.start_application()
+        except Exception as e:
+            logger.error(f'_apply_daily_settings {instance_name}: {e}')
+
+    async def _run_backup(self, cfg: dict, backup_days: list = None):
+        """Take an AMP backup, optionally skipping based on backup_days."""
+        instance_name = cfg['instance_name']
+        instance = await _get_amp_instance(instance_name)
+        if not instance:
+            return
+        day_name = datetime.datetime.utcnow().strftime('%A')
+        if backup_days is not None and day_name not in backup_days:
+            logger.info(f'Backup scheduler: skipping {instance_name} on {day_name} (not in backup_days)')
+            return
+        logger.info(f'Backup scheduler: taking backup for {instance_name} on {day_name}')
+        try:
+            await instance.take_backup(
+                f'Auto-{day_name}',
+                f'Scheduled daily backup ({day_name})',
+                False
+            )
+        except Exception as e:
+            logger.error(f'_run_backup {instance_name}: {e}')
+
+        # Post update to channel
+        update_channel = cfg.get('server_update_channel_id')
+        if update_channel:
+            color = GAME_COLORS.get(cfg.get('game_type', ''), DEFAULT_COLOR)
+            display = cfg.get('server_display_name') or cfg['instance_name']
+            embed = fluxer.Embed(
+                title=f'Daily Restart - {display}',
+                description=f'Server restarted for {day_name}. Backup taken.',
+                color=color,
+            )
+            if overrides:
+                embed.add_field(
+                    name='Settings Applied',
+                    value='\n'.join(f'`{k}` = `{v}`' for k, v in list(overrides.items())[:8]),
+                    inline=False,
+                )
+            embed.set_footer(text='QuestLogFluxer auto-scheduler')
+            try:
+                await self.bot._http.send_message(str(update_channel), embeds=[embed])
+            except Exception as e:
+                logger.error(f'daily update post {instance_name}: {e}')
+
+    # ---- Generic commands (work for any game) ----
+
+    def _get_cfg_for_guild(self, guild_id: str) -> list[dict]:
+        configs = _load_all_configs()
+        return [c for c in configs if str(c.get('guild_id')) == str(guild_id)]
+
+    @Cog.command(name='gs_status')
+    async def gs_status(self, ctx):
+        """Show status of all configured game servers for this guild."""
+        guild_id = str(ctx.guild.id) if ctx.guild else None
+        if not guild_id:
+            return
+        configs = self._get_cfg_for_guild(guild_id)
+        if not configs:
+            embed = fluxer.Embed(description='No game servers configured for this server.', color=0xFF4444)
+            await self.bot._http.send_message(str(ctx.channel.id), embeds=[embed])
+            return
+        for cfg in configs:
+            embed = await build_serverinfo_embed(cfg)
+            await self.bot._http.send_message(str(ctx.channel.id), embeds=[embed])
+
+    @Cog.command(name='gs_start')
+    async def gs_start(self, ctx, instance: str = None):
+        """Start a game server. Usage: !gs_start <instance_name>"""
+        guild_id = str(ctx.guild.id) if ctx.guild else None
+        if not guild_id:
+            return
+        cfg = self._resolve_instance(guild_id, instance, ctx)
+        if not cfg:
+            return
+        if not await _has_permission(cfg, ctx):
+            embed = fluxer.Embed(description='You do not have permission.', color=0xFF4444)
+            await self.bot._http.send_message(str(ctx.channel.id), embeds=[embed])
+            return
+        amp_inst = await _get_amp_instance(cfg['instance_name'])
+        if not amp_inst:
+            embed = fluxer.Embed(description='Could not connect to AMP.', color=0xFF4444)
+            await self.bot._http.send_message(str(ctx.channel.id), embeds=[embed])
+            return
+        await amp_inst.start_application()
+        embed = fluxer.Embed(
+            description=f'Start command sent to **{cfg.get("server_display_name") or cfg["instance_name"]}**.',
+            color=0x00FF88,
+        )
+        await self.bot._http.send_message(str(ctx.channel.id), embeds=[embed])
+
+    @Cog.command(name='gs_stop')
+    async def gs_stop(self, ctx, instance: str = None):
+        """Stop a game server. Usage: !gs_stop <instance_name>"""
+        guild_id = str(ctx.guild.id) if ctx.guild else None
+        if not guild_id:
+            return
+        cfg = self._resolve_instance(guild_id, instance, ctx)
+        if not cfg:
+            return
+        if not await _has_permission(cfg, ctx):
+            embed = fluxer.Embed(description='You do not have permission.', color=0xFF4444)
+            await self.bot._http.send_message(str(ctx.channel.id), embeds=[embed])
+            return
+        amp_inst = await _get_amp_instance(cfg['instance_name'])
+        if not amp_inst:
+            embed = fluxer.Embed(description='Could not connect to AMP.', color=0xFF4444)
+            await self.bot._http.send_message(str(ctx.channel.id), embeds=[embed])
+            return
+        await amp_inst.stop_application()
+        embed = fluxer.Embed(
+            description=f'Stop command sent to **{cfg.get("server_display_name") or cfg["instance_name"]}**.',
+            color=0xFF8C00,
+        )
+        await self.bot._http.send_message(str(ctx.channel.id), embeds=[embed])
+
+    @Cog.command(name='gs_restart')
+    async def gs_restart(self, ctx, instance: str = None):
+        """Restart a game server. Usage: !gs_restart <instance_name>"""
+        guild_id = str(ctx.guild.id) if ctx.guild else None
+        if not guild_id:
+            return
+        cfg = self._resolve_instance(guild_id, instance, ctx)
+        if not cfg:
+            return
+        if not await _has_permission(cfg, ctx):
+            embed = fluxer.Embed(description='You do not have permission.', color=0xFF4444)
+            await self.bot._http.send_message(str(ctx.channel.id), embeds=[embed])
+            return
+        amp_inst = await _get_amp_instance(cfg['instance_name'])
+        if not amp_inst:
+            embed = fluxer.Embed(description='Could not connect to AMP.', color=0xFF4444)
+            await self.bot._http.send_message(str(ctx.channel.id), embeds=[embed])
+            return
+        await amp_inst.restart_application()
+        embed = fluxer.Embed(
+            description=f'Restart command sent to **{cfg.get("server_display_name") or cfg["instance_name"]}**.',
+            color=0x00BFFF,
+        )
+        await self.bot._http.send_message(str(ctx.channel.id), embeds=[embed])
+
+    @Cog.command(name='gs_backup')
+    async def gs_backup(self, ctx, instance: str = None):
+        """Take a backup. Usage: !gs_backup <instance_name>"""
+        guild_id = str(ctx.guild.id) if ctx.guild else None
+        if not guild_id:
+            return
+        cfg = self._resolve_instance(guild_id, instance, ctx)
+        if not cfg:
+            return
+        if not await _has_permission(cfg, ctx):
+            embed = fluxer.Embed(description='You do not have permission.', color=0xFF4444)
+            await self.bot._http.send_message(str(ctx.channel.id), embeds=[embed])
+            return
+        amp_inst = await _get_amp_instance(cfg['instance_name'])
+        if not amp_inst:
+            embed = fluxer.Embed(description='Could not connect to AMP.', color=0xFF4444)
+            await self.bot._http.send_message(str(ctx.channel.id), embeds=[embed])
+            return
+        label = f'Manual-{datetime.datetime.utcnow().strftime("%Y%m%d-%H%M")}'
+        await amp_inst.take_backup(label, f'Manual backup via !gs_backup', False)
+        embed = fluxer.Embed(
+            description=f'Backup `{label}` started for **{cfg.get("server_display_name") or cfg["instance_name"]}**.',
+            color=0x00FF88,
+        )
+        await self.bot._http.send_message(str(ctx.channel.id), embeds=[embed])
+
+    @Cog.command(name='gs_players')
+    async def gs_players(self, ctx, instance: str = None):
+        """List online players. Usage: !gs_players <instance_name>"""
+        guild_id = str(ctx.guild.id) if ctx.guild else None
+        if not guild_id:
+            return
+        cfg = self._resolve_instance(guild_id, instance, ctx)
+        if not cfg:
+            return
+        players = _get_online_players(cfg['instance_name'])
+        color = GAME_COLORS.get(cfg.get('game_type', ''), DEFAULT_COLOR)
+        display = cfg.get('server_display_name') or cfg['instance_name']
+        if players:
+            embed = fluxer.Embed(
+                title=f'{display} - Online Players ({len(players)})',
+                description='\n'.join(players),
+                color=color,
+            )
+        else:
+            embed = fluxer.Embed(
+                title=f'{display} - Online Players',
+                description='No players currently online.',
+                color=color,
+            )
+        await self.bot._http.send_message(str(ctx.channel.id), embeds=[embed])
+
+    @Cog.command(name='gs_serverinfo')
+    async def gs_serverinfo(self, ctx, instance: str = None):
+        """Post a live server info panel. Usage: !gs_serverinfo <instance_name>"""
+        guild_id = str(ctx.guild.id) if ctx.guild else None
+        if not guild_id:
+            return
+        cfg = self._resolve_instance(guild_id, instance, ctx)
+        if not cfg:
+            return
+        if not await _has_permission(cfg, ctx):
+            embed = fluxer.Embed(description='You do not have permission.', color=0xFF4444)
+            await self.bot._http.send_message(str(ctx.channel.id), embeds=[embed])
+            return
+        # Post to configured stats channel if set, otherwise fall back to command channel
+        target_channel = cfg.get('stats_channel_id') or str(ctx.channel.id)
+        embed = await build_serverinfo_embed(cfg)
+        try:
+            resp = await self.bot._http.send_message(str(target_channel), embeds=[embed])
+            new_id = resp.get('id') if isinstance(resp, dict) else None
+            _update_serverinfo_id(cfg['instance_name'], new_id)
+            if target_channel != str(ctx.channel.id):
+                confirm = fluxer.Embed(description=f'Server panel posted to <#{target_channel}>.', color=0x00CC66)
+                await self.bot._http.send_message(str(ctx.channel.id), embeds=[confirm])
+        except Exception as e:
+            logger.error(f'gs_serverinfo send: {e}')
+
+    def _resolve_instance(self, guild_id: str, instance_arg: str | None, ctx) -> dict | None:
+        """Find the right config for this guild. If one server, use it. If multiple, require name arg."""
+        configs = self._get_cfg_for_guild(guild_id)
+        if not configs:
+            embed = fluxer.Embed(description='No game servers configured for this guild.', color=0xFF4444)
+            asyncio.ensure_future(
+                self.bot._http.send_message(str(ctx.channel.id), embeds=[embed])
+            )
+            return None
+        if len(configs) == 1:
+            return configs[0]
+        if not instance_arg:
+            names = ', '.join(f'`{c["instance_name"]}`' for c in configs)
+            embed = fluxer.Embed(
+                description=f'Multiple servers configured. Specify one: {names}',
+                color=0xFF8C00,
+            )
+            asyncio.ensure_future(
+                self.bot._http.send_message(str(ctx.channel.id), embeds=[embed])
+            )
+            return None
+        match = next((c for c in configs if c['instance_name'].lower() == instance_arg.lower()), None)
+        if not match:
+            embed = fluxer.Embed(description=f'Instance `{instance_arg}` not found.', color=0xFF4444)
+            asyncio.ensure_future(
+                self.bot._http.send_message(str(ctx.channel.id), embeds=[embed])
+            )
+        return match
