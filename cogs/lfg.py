@@ -1,17 +1,17 @@
 # cogs/lfg.py - Looking for Group
 #
-# !lfg                  - Link to this server's LFG page on QuestLog
-# !lfg delete <id>      - Delete your LFG group (or any group if admin)
+# !lfg                  - Browse LFG groups for this server (link to portal)
+# !lfg create           - Link to create an LFG group on QuestLog
+# !lfg games            - List configured LFG games for this server
 # !lfg list             - Alias for !lfglist
+# !lfg delete <id>      - Delete your LFG group (or any group if admin)
+# !lfg leave <id>       - Leave an LFG group you joined
+# !lfg fluxer           - Link to this server's Fluxer LFG portal
 # !lfglist              - Show active LFG groups for this server
 # !lfgjoin <id>         - Get link to join a group on QuestLog
 # !lfgql                - Link to the public QuestLog Network LFG
 # !setup lfg [#channel] - Register this channel for LFG announcements
 # !setup status         - Show current bot config
-#
-# Group creation happens on the website (full game search + templates + publish toggle).
-# Web -> Fluxer broadcast: polls fluxer_pending_broadcasts every 5s (website-triggered only).
-# TODO: When Fluxer ships slash commands/dropdowns, bring creation flow into the bot.
 
 import asyncio
 import json
@@ -173,35 +173,11 @@ def _delete_web_lfg_group(group_id: int, web_user_id: int, force: bool = False) 
 
 
 async def _is_guild_admin(ctx) -> bool:
-    """Returns True if the author is guild owner or has Administrator/Manage Server permission.
-
-    ctx.author is a User (no guild_permissions), so we must call the HTTP API
-    to compute permissions from the member's roles.
-
-    Raises RuntimeError on any HTTP failure - callers must handle and deny the action
-    (fail closed: if we can't verify, we deny rather than allow).
+    """Returns True if the author is guild owner or has Administrator permission.
+    Delegates to permissions.py is_administrator.
     """
-    if not ctx.guild_id or not ctx._http:
-        return False
-    guild_data, member_data, roles_data = await asyncio.gather(
-        ctx._http.get_guild(ctx.guild_id),
-        ctx._http.get_guild_member(ctx.guild_id, ctx.author.id),
-        ctx._http.get_guild_roles(ctx.guild_id),
-    )
-    # Guild owner bypasses all checks
-    if ctx.author.id == int(guild_data["owner_id"]):
-        return True
-    # Compute permissions - @everyone role has the same ID as the guild
-    member_role_ids = {int(r) for r in member_data.get("roles", [])}
-    guild_id_int = int(ctx.guild_id)
-    computed = 0
-    for role in roles_data:
-        role_id = int(role["id"])
-        # Include @everyone role (id == guild_id) and all roles the member has
-        if role_id == guild_id_int or role_id in member_role_ids:
-            computed |= int(role["permissions"])
-    from fluxer.enums import Permissions
-    return bool(computed & (Permissions.ADMINISTRATOR | Permissions.MANAGE_GUILD))
+    from cogs.permissions import is_administrator
+    return await is_administrator(ctx)
 
 
 # ---------------------------------------------------------------------------
@@ -286,6 +262,24 @@ class LfgCog(Cog):
     async def on_guild_join(self, guild):
         """Sync channels when the bot joins a new guild."""
         await self._sync_guild_channels(guild_ids=[guild.id])
+
+    @Cog.listener()
+    async def on_channel_create(self, channel):
+        gid = getattr(channel, 'guild_id', None)
+        if gid:
+            await self._sync_guild_channels(guild_ids=[gid])
+
+    @Cog.listener()
+    async def on_channel_delete(self, channel):
+        gid = getattr(channel, 'guild_id', None) or (channel.get('guild_id') if isinstance(channel, dict) else None)
+        if gid:
+            await self._sync_guild_channels(guild_ids=[gid])
+
+    @Cog.listener()
+    async def on_channel_update(self, channel):
+        gid = getattr(channel, 'guild_id', None)
+        if gid:
+            await self._sync_guild_channels(guild_ids=[gid])
 
     async def _sync_guild_names(self):
         """Back-fill guild_name for any configs where it is NULL or empty."""
@@ -419,14 +413,19 @@ class LfgCog(Cog):
                             continue
 
                         # action == "post" - send new message, pin it, store ID
-                        channel = await self.bot.fetch_channel(int(channel_id))
                         embed = self._build_embed(embed_data)
-                        sent = await channel.send(embed=embed)
-                        new_message_id = str(sent.id) if sent and hasattr(sent, 'id') else None
+                        logger.info(f"_dispatch_pending_broadcasts: sending to guild={guild_id} channel={channel_id}")
+                        resp = await self.bot._http.send_message(
+                            str(channel_id),
+                            embed=embed,
+                        )
+                        new_message_id = str(resp.get("id")) if resp and resp.get("id") else None
+                        logger.info(f"_dispatch_pending_broadcasts: sent message_id={new_message_id} to channel={channel_id}")
 
                         if new_message_id:
-                            # Pin immediately
-                            await self._pin_message(str(channel_id), new_message_id)
+                            # Pin only LFG group posts (not new_member / new_post / other notifications)
+                            if track_group_id:
+                                await self._pin_message(str(channel_id), new_message_id)
 
                             # Store message ID for future edits
                             if track_group_id and guild_id:
@@ -480,25 +479,49 @@ class LfgCog(Cog):
         try:
             now = int(time.time())
 
-            # Build list of (guild_id, guild_name, channel_id, channel_name, channel_type)
-            # Use ch._guild.name (set from GUILD_CREATE, always reliable) instead of bot.guilds
-            # which may have name=None at READY time before GUILD_CREATE events arrive.
-            entries = []
+            # Collect guild_id -> guild_name mapping from cache
+            guild_names: dict[str, str] = {}
+            for g in self.bot.guilds:
+                gid = str(g.id)
+                if guild_ids and g.id not in guild_ids:
+                    continue
+                guild_names[gid] = (getattr(g, 'name', '') or '')
+
+            target_guild_ids = list(guild_names.keys()) if not guild_ids else [str(g) for g in guild_ids]
+
+            # Build entries from bot._channels cache first
+            entries: dict[str, tuple] = {}  # channel_id -> (guild_id, guild_name, channel_id, channel_name, channel_type)
             for ch in self.bot._channels.values():
                 if ch.guild_id is None:
                     continue
+                gid = str(ch.guild_id)
                 if guild_ids and ch.guild_id not in guild_ids:
                     continue
                 if ch.type not in (0, 5):  # 0=text, 5=news
                     continue
-                gname = (ch._guild.name if (ch._guild and ch._guild.name) else None) or ''
-                entries.append((str(ch.guild_id), gname, str(ch.id), ch.name or str(ch.id), ch.type))
+                gname = guild_names.get(gid) or (ch._guild.name if (ch._guild and ch._guild.name) else '') or ''
+                entries[str(ch.id)] = (gid, gname, str(ch.id), ch.name or str(ch.id), ch.type)
+
+            # Supplement with HTTP fetch to catch channels created while bot was offline
+            for gid in target_guild_ids:
+                try:
+                    ch_data = await self.bot.http.get_guild_channels(gid)
+                    for ch in (ch_data or []):
+                        ch_id = str(ch.get('id', '') or '')
+                        ch_name = str(ch.get('name', '') or '')
+                        ch_type = int(ch.get('type', 0) or 0)
+                        if not ch_id or not ch_name or ch_type not in (0, 5):
+                            continue
+                        if ch_id not in entries:
+                            entries[ch_id] = (gid, guild_names.get(gid, ''), ch_id, ch_name, ch_type)
+                except Exception:
+                    pass  # HTTP fetch failed - rely on cache only for this guild
 
             if not entries:
                 return
 
             with db_session_scope() as db:
-                for guild_id, guild_name, channel_id, channel_name, channel_type in entries:
+                for guild_id, guild_name, channel_id, channel_name, channel_type in entries.values():
                     db.execute(
                         text(
                             "INSERT INTO web_fluxer_guild_channels "
@@ -520,6 +543,26 @@ class LfgCog(Cog):
                         },
                     )
                 db.commit()
+
+            # Remove stale channels - only delete if we got a full list from HTTP
+            # (skip deletion if HTTP failed and we only have the cache)
+            live_channel_ids = list(entries.keys())
+            guild_ids_in_sync = list({str(e[0]) for e in entries.values()})
+            if live_channel_ids and guild_ids_in_sync:
+                with db_session_scope() as db:
+                    placeholders = ','.join([f':cid{i}' for i in range(len(live_channel_ids))])
+                    gplaceholders = ','.join([f':gid{i}' for i in range(len(guild_ids_in_sync))])
+                    params = {f'cid{i}': cid for i, cid in enumerate(live_channel_ids)}
+                    params.update({f'gid{i}': gid for i, gid in enumerate(guild_ids_in_sync)})
+                    result = db.execute(text(
+                        f"DELETE FROM web_fluxer_guild_channels "
+                        f"WHERE guild_id IN ({gplaceholders}) "
+                        f"AND channel_id NOT IN ({placeholders})"
+                    ), params)
+                    if result.rowcount:
+                        logger.info(f"Removed {result.rowcount} stale channel(s) from DB")
+                    db.commit()
+
             logger.info(f"Synced {len(entries)} Fluxer channels to DB")
         except Exception as e:
             logger.error(f"_sync_guild_channels error: {e}", exc_info=True)
@@ -600,7 +643,8 @@ class LfgCog(Cog):
             return
 
         # Subcommand routing
-        first_word = args.strip().split()[0].lower() if args.strip() else ""
+        parts = args.strip().split()
+        first_word = parts[0].lower() if parts else ""
         if first_word == "setup":
             await self._setup_lfg(ctx)
             return
@@ -608,7 +652,19 @@ class LfgCog(Cog):
             await self.lfglist(ctx)
             return
         if first_word == "delete":
-            await self._lfg_delete(ctx, args.strip()[6:].strip())
+            await self._lfg_delete(ctx, args.strip()[6:].strip().lstrip('#'))
+            return
+        if first_word == "games":
+            await self._lfg_games(ctx)
+            return
+        if first_word == "leave":
+            await self._lfg_leave(ctx, parts[1].lstrip('#') if len(parts) > 1 else "")
+            return
+        if first_word == "create":
+            await self._lfg_create(ctx)
+            return
+        if first_word == "fluxer":
+            await self._lfg_fluxer(ctx)
             return
 
         guild_id = str(ctx.guild.id if hasattr(ctx.guild, 'id') else ctx.guild_id)
@@ -636,13 +692,17 @@ class LfgCog(Cog):
             url=guild_lfg_url,
         )
         embed.add_field(
-            name="QuestLog Network",
-            value=f"Find players from other servers: `!lfgql`",
-            inline=False,
-        )
-        embed.add_field(
-            name="Delete a group",
-            value="`!lfg delete <id>`",
+            name="Commands",
+            value=(
+                "`!lfg create` - Create a new group\n"
+                "`!lfg games` - See configured games\n"
+                "`!lfglist` - Show active groups\n"
+                "`!lfgjoin <id>` - Join a group\n"
+                "`!lfg leave <id>` - Leave a group\n"
+                "`!lfg delete <id>` - Delete your group\n"
+                "`!lfg fluxer` - Fluxer LFG portal\n"
+                "`!lfgql` - QuestLog Network LFG"
+            ),
             inline=False,
         )
         embed.set_footer(text="casual-heroes.com/ql/")
@@ -741,7 +801,7 @@ class LfgCog(Cog):
     @Cog.command()
     async def lfgjoin(self, ctx, *, args: str = ""):
         """!lfgjoin <id>  -  Go to QuestLog to join an LFG group and pick your class/spec."""
-        arg = args.strip()
+        arg = args.strip().lstrip('#')
         if not arg or not arg.isdigit():
             await ctx.reply(embed=fluxer.Embed(
                 title="Join LFG",
@@ -810,6 +870,186 @@ class LfgCog(Cog):
                 description=f"Unknown: `{subcommand}`. Try `!setup lfg` or `!setup status`.",
                 color=RED_COLOR,
             ))
+
+    # -----------------------------------------------------------------------
+    # !lfg games
+    # -----------------------------------------------------------------------
+
+    async def _lfg_games(self, ctx):
+        """Show configured LFG games for this server."""
+        guild_id = str(ctx.guild.id if ctx.guild and hasattr(ctx.guild, 'id') else (ctx.guild_id or ''))
+        guild_lfg_url = f"{QL_BASE}/ql/fluxer/{guild_id}/lfg/browse/" if guild_id else QUESTLOG_LFG_URL
+        try:
+            with db_session_scope() as db:
+                rows = db.execute(
+                    text(
+                        "SELECT name, emoji, max_group_size "
+                        "FROM web_fluxer_lfg_games "
+                        "WHERE guild_id = :gid AND enabled = 1 "
+                        "ORDER BY name ASC LIMIT 20"
+                    ),
+                    {"gid": guild_id},
+                ).fetchall()
+
+            if not rows:
+                await ctx.reply(embed=fluxer.Embed(
+                    title="LFG Games",
+                    description=(
+                        "No LFG games configured for this server yet.\n\n"
+                        f"Ask an admin to add games via the [Fluxer Dashboard]({QL_BASE}/ql/dashboard/fluxer/{guild_id}/)."
+                    ),
+                    color=GOLD_COLOR,
+                ))
+                return
+
+            lines = []
+            for game_name, game_emoji, max_size in rows:
+                emoji = (game_emoji + " ") if game_emoji else ""
+                lines.append(f"{emoji}**{game_name}** - up to {max_size} players")
+
+            embed = fluxer.Embed(
+                title=f"LFG Games ({len(rows)})",
+                description="\n".join(lines) + f"\n\n[Browse Groups]({guild_lfg_url})",
+                color=GOLD_COLOR,
+                url=guild_lfg_url,
+            )
+            embed.set_footer(text="casual-heroes.com/ql/")
+            await ctx.reply(embed=embed)
+        except Exception as e:
+            logger.error(f"LFG games list failed: {e}", exc_info=True)
+            await ctx.reply(embed=fluxer.Embed(
+                title="Error", description="Could not fetch LFG games.", color=RED_COLOR
+            ))
+
+    # -----------------------------------------------------------------------
+    # !lfg leave <id>
+    # -----------------------------------------------------------------------
+
+    async def _lfg_leave(self, ctx, id_str: str):
+        """Leave an LFG group by ID."""
+        if not id_str or not id_str.isdigit():
+            await ctx.reply(embed=fluxer.Embed(
+                description="**Usage:** `!lfg leave <id>`\n\nUse `!lfglist` to see group IDs.",
+                color=RED_COLOR,
+            ))
+            return
+
+        group_id = int(id_str)
+        fluxer_user_id = str(ctx.author.id)
+        web_user_id, web_username = _get_web_user_by_fluxer_id(fluxer_user_id)
+
+        if not web_user_id:
+            await ctx.reply(embed=fluxer.Embed(
+                description=(
+                    "You need a linked QuestLog account to leave groups.\n\n"
+                    f"[Create a free account]({QUESTLOG_REGISTER_URL}) or "
+                    f"[link your existing account](https://casual-heroes.com/ql/settings/)."
+                ),
+                color=PURPLE_COLOR,
+            ))
+            return
+
+        try:
+            with db_session_scope() as db:
+                member_row = db.execute(
+                    text(
+                        "SELECT id FROM web_fluxer_lfg_members "
+                        "WHERE group_id = :gid AND web_user_id = :uid"
+                    ),
+                    {"gid": group_id, "uid": web_user_id},
+                ).fetchone()
+
+                if not member_row:
+                    await ctx.reply(embed=fluxer.Embed(
+                        description=f"You are not in Group **#{group_id}**.",
+                        color=RED_COLOR,
+                    ))
+                    return
+
+                db.execute(
+                    text("DELETE FROM web_fluxer_lfg_members WHERE id = :id"),
+                    {"id": member_row[0]},
+                )
+                # Update current_size
+                db.execute(
+                    text(
+                        "UPDATE web_fluxer_lfg_groups "
+                        "SET current_size = GREATEST(0, current_size - 1), "
+                        "    status = IF(status = 'full', 'open', status) "
+                        "WHERE id = :gid"
+                    ),
+                    {"gid": group_id},
+                )
+                db.commit()
+
+            await ctx.reply(embed=fluxer.Embed(
+                title="Left Group",
+                description=f"You've left Group **#{group_id}**.",
+                color=GREEN_COLOR,
+            ))
+            logger.info(f"User {web_username} (web_id={web_user_id}) left Fluxer LFG group #{group_id}")
+        except Exception as e:
+            logger.error(f"LFG leave failed: {e}", exc_info=True)
+            await ctx.reply(embed=fluxer.Embed(
+                title="Error", description="Could not process your leave request.", color=RED_COLOR
+            ))
+
+    # -----------------------------------------------------------------------
+    # !lfg create
+    # -----------------------------------------------------------------------
+
+    async def _lfg_create(self, ctx):
+        """Direct link to create an LFG group on QuestLog for this server."""
+        if not ctx.guild:
+            return
+        guild_id = str(ctx.guild.id if hasattr(ctx.guild, 'id') else ctx.guild_id)
+        create_url = f"{QL_BASE}/ql/fluxer/{guild_id}/lfg/browse/"
+        fluxer_user_id = str(ctx.author.id)
+        web_user_id, web_username = _get_web_user_by_fluxer_id(fluxer_user_id)
+
+        if web_user_id:
+            desc = (
+                f"You're signed in as **{web_username}** on QuestLog.\n\n"
+                f"[Create an LFG Group]({create_url})\n\n"
+                "Use the **Create Group** button on the LFG page."
+            )
+        else:
+            desc = (
+                f"[Create an LFG Group for this server]({create_url})\n\n"
+                f"**No QuestLog account?** [Register free]({QUESTLOG_REGISTER_URL}) "
+                "to post groups, earn XP, and track your gaming sessions."
+            )
+
+        embed = fluxer.Embed(
+            title="Create LFG Group",
+            description=desc,
+            color=GOLD_COLOR,
+            url=create_url,
+        )
+        embed.set_footer(text="casual-heroes.com/ql/")
+        await ctx.reply(embed=embed)
+
+    # -----------------------------------------------------------------------
+    # !lfg fluxer
+    # -----------------------------------------------------------------------
+
+    async def _lfg_fluxer(self, ctx):
+        """Link to this server's Fluxer LFG member portal."""
+        if not ctx.guild:
+            return
+        guild_id = str(ctx.guild.id if hasattr(ctx.guild, 'id') else ctx.guild_id)
+        portal_url = f"{QL_BASE}/ql/fluxer/{guild_id}/lfg/browse/"
+        embed = fluxer.Embed(
+            title="Fluxer LFG Portal",
+            description=(
+                f"Browse, join, and create LFG groups for **{ctx.guild.name}** on QuestLog.\n\n"
+                f"[Open Fluxer LFG Portal]({portal_url})"
+            ),
+            color=PURPLE_COLOR,
+            url=portal_url,
+        )
+        embed.set_footer(text="casual-heroes.com/ql/")
+        await ctx.reply(embed=embed)
 
     async def _setup_lfg(self, ctx):
         """Register the current channel for LFG. No webhook URL needed."""
@@ -917,7 +1157,7 @@ class LfgCog(Cog):
                     channel = f"<#{channel_id}>" if channel_id else "Not set"
                     embed.add_field(name=label, value=f"{status} | {channel}", inline=False)
 
-            embed.set_footer(text=f"Manage at casual-heroes.com/ql/dashboard/fluxer/{setup_guild_id}/")
+            embed.set_footer(text=f"Manage at casual-heroes.com/ql/dashboard/fluxer/{guild_id}/")
             await ctx.reply(embed=embed)
         except Exception as e:
             logger.error(f"Setup status failed: {e}", exc_info=True)

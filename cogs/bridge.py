@@ -35,9 +35,10 @@ import re
 import aiohttp
 from fluxer import Cog, File
 
-from config import logger, QUESTLOG_INTERNAL_API_URL, QUESTLOG_BOT_SECRET
+from config import logger, QUESTLOG_INTERNAL_API_URL, QUESTLOG_BOT_SECRET, DISCORD_BOT_TOKEN
 
 _BASE = QUESTLOG_INTERNAL_API_URL.rstrip('/')
+_TYPING_URL             = _BASE + '/api/internal/bridge/typing/'
 _RELAY_URL              = _BASE + '/api/internal/bridge/relay/'
 _PENDING_URL            = _BASE + '/api/internal/bridge/pending/fluxer/'
 _MSG_MAP_URL            = _BASE + '/api/internal/bridge/message-map/'
@@ -45,6 +46,8 @@ _REACTION_URL           = _BASE + '/api/internal/bridge/reaction/'
 _PENDING_REACTIONS_URL  = _BASE + '/api/internal/bridge/pending-reactions/fluxer/'
 _DELETE_URL             = _BASE + '/api/internal/bridge/delete/'
 _PENDING_DELETIONS_URL  = _BASE + '/api/internal/bridge/pending-deletions/fluxer/'
+_EDIT_URL               = _BASE + '/api/internal/bridge/edit/'
+_PENDING_EDITS_URL      = _BASE + '/api/internal/bridge/pending-edits/fluxer/'
 
 _HEADERS = {'X-Bot-Secret': QUESTLOG_BOT_SECRET, 'Content-Type': 'application/json'}
 
@@ -52,6 +55,26 @@ _HEADERS = {'X-Bot-Secret': QUESTLOG_BOT_SECRET, 'Content-Type': 'application/js
 _RELAY_PREFIXES = ('**[D]', '**[F]', '**[M]', '[D]', '[F]', '[M]')
 
 _CUSTOM_EMOJI_RE = re.compile(r'<a?:(\w+):\d+>')
+
+# Matches a string that is purely one or more URLs (possibly separated by whitespace)
+_URL_ONLY_RE = re.compile(r'^(https?://\S+\s*)+$')
+
+
+def _format_bridged(tag: str, author: str, content: str, reply_quote: str = '') -> str:
+    """
+    Format a bridged message for delivery.
+    If content is a bare URL (or URLs), put them on a new line so the platform
+    can unfurl the link preview. Mixed text+URL stays on one line.
+    """
+    header = f"**[{tag}] {author}:**"
+    body = content.rstrip() if content else ''
+    if reply_quote:
+        prefix = f"> {reply_quote}\n"
+    else:
+        prefix = ''
+    if body and _URL_ONLY_RE.match(body):
+        return f"{prefix}{header}\n{body}"
+    return f"{prefix}{header} {body}".rstrip()
 
 
 def _resolve_fluxer_content(message) -> tuple:
@@ -153,20 +176,74 @@ class BridgeCog(Cog):
                     'content_type': str(getattr(att, 'content_type', '') or ''),
                 })
 
+        # Extract image/GIF URLs from embeds (Tenor, Giphy, direct image embeds)
+        for emb in (message.embeds or []):
+            img_url = None
+            if getattr(emb, 'type', None) == 'gifv':
+                video = getattr(emb, 'video', None)
+                thumb = getattr(emb, 'thumbnail', None)
+                if thumb:
+                    img_url = str(getattr(thumb, 'proxy_url', None) or getattr(thumb, 'url', None) or '')
+                elif video:
+                    img_url = str(getattr(video, 'url', '') or '')
+            elif getattr(emb, 'type', None) == 'image' and getattr(emb, 'url', None):
+                img_url = str(emb.url)
+            elif getattr(emb, 'image', None) and getattr(emb.image, 'url', None):
+                img_url = str(emb.image.url)
+            elif getattr(emb, 'thumbnail', None) and getattr(emb.thumbnail, 'url', None) and getattr(emb, 'type', None) in ('rich', 'link'):
+                img_url = str(emb.thumbnail.url)
+            if img_url and img_url.startswith('https://'):
+                lower = img_url.split('?')[0].lower()
+                if lower.endswith('.gif') or 'tenor.com' in img_url or 'giphy.com' in img_url:
+                    fname, ctype = 'image.gif', 'image/gif'
+                elif lower.endswith('.png'):
+                    fname, ctype = 'image.png', 'image/png'
+                elif lower.endswith(('.jpg', '.jpeg')):
+                    fname, ctype = 'image.jpg', 'image/jpeg'
+                elif lower.endswith('.webp'):
+                    fname, ctype = 'image.webp', 'image/webp'
+                else:
+                    fname, ctype = 'image.gif', 'image/gif'
+                attachments.append({'url': img_url, 'filename': fname, 'content_type': ctype})
+
         # Skip if no content and no attachments
         if not content and not attachments:
             return
 
-        # Reply context: include a quote if this is a reply
+        # Reply vs forward detection.
+        # Fluxer sends referenced_message for both replies and forwards.
+        # A forward has a referenced message from a DIFFERENT channel.
         reply_quote = None
         reply_to_message_id = None
-        if message.referenced_message:
-            ref_content = (message.referenced_message.content or '').strip()
-            if ref_content:
-                reply_quote = _format_reply_quote(ref_content)
-            reply_to_message_id = str(message.referenced_message.id)
+        is_forward = False
+        forward_from_author = None
+        forward_content = None
 
-        channel_id = str(message.channel.id)
+        if message.referenced_message:
+            ref = message.referenced_message
+            # Use channel_id int attribute directly (Message dataclass field)
+            ref_channel_id = ref.channel_id
+            current_channel_id = message.channel_id
+            if ref_channel_id and ref_channel_id != current_channel_id:
+                # Different channel = forward
+                is_forward = True
+                ref_author = getattr(ref, 'author', None)
+                forward_from_author = (
+                    getattr(ref_author, 'display_name', None) or
+                    getattr(ref_author, 'username', None) or 'Unknown'
+                ) if ref_author else 'Unknown'
+                forward_content = (ref.content or '').strip()
+            else:
+                ref_content = (ref.content or '').strip()
+                if ref_content:
+                    reply_quote = _format_reply_quote(ref_content)
+                reply_to_message_id = str(ref.id)
+
+        # If this is a forward, prepend the forwarded content
+        if is_forward and forward_content:
+            content = f"[forwarded from {forward_from_author}]\n> {forward_content}" + (f"\n{content}" if content else '')
+
+        channel_id = str(message.channel_id)
         avatar_url = message.author.avatar_url  # Fluxer User.avatar_url property
         payload = {
             'source_platform': 'fluxer',
@@ -192,7 +269,7 @@ class BridgeCog(Cog):
                             # Channel not in any bridge - ignore silently
                             return
                     elif resp.status not in (200, 201):
-                        logger.debug(f"BridgeCog: relay non-200: {resp.status}")
+                        logger.warning(f"BridgeCog: relay POST returned {resp.status} to {_RELAY_URL}")
         except Exception as e:
             logger.debug(f"BridgeCog: relay POST error: {e}")
 
@@ -215,6 +292,36 @@ class BridgeCog(Cog):
                     pass  # best-effort
         except Exception as e:
             logger.debug(f"BridgeCog: delete relay error: {e}")
+
+    @Cog.listener()
+    async def on_message_edit(self, message):
+        """Relay Fluxer message edits to Discord via hub."""
+        message_id = str(message.id)
+        channel_id = str(message.channel_id)
+        new_content = (message.content or '').strip()
+
+        if not message_id or not channel_id or not new_content:
+            return
+        if message.author.id == self.bot.user.id:
+            return
+        if new_content.startswith(_RELAY_PREFIXES):
+            return
+        try:
+            if self._session and not self._session.closed:
+                async with self._session.post(
+                    _EDIT_URL,
+                    json={
+                        'platform': 'fluxer',
+                        'message_id': message_id,
+                        'channel_id': channel_id,
+                        'new_content': new_content,
+                    },
+                    headers=_HEADERS,
+                    timeout=aiohttp.ClientTimeout(total=5)
+                ) as resp:
+                    pass
+        except Exception as e:
+            logger.debug(f"BridgeCog: edit relay error: {e}")
 
     @Cog.listener()
     async def on_raw_reaction_add(self, payload):
@@ -246,8 +353,50 @@ class BridgeCog(Cog):
         except Exception as e:
             logger.debug(f"BridgeCog: reaction relay error: {e}")
 
+    @Cog.listener()
+    async def on_typing_start(self, data):
+        """Relay Fluxer typing indicators to Discord via Discord API."""
+        # data = raw gateway TYPING_START payload: {channel_id, user_id, ...}
+        channel_id = str(data.get('channel_id', '') or '')
+        user_id = str(data.get('user_id', '') or '')
+        if not channel_id or not user_id:
+            return
+        # Ignore own bot typing
+        if self.bot.user and str(self.bot.user.id) == user_id:
+            return
+        if not self._session or self._session.closed:
+            return
+        try:
+            async with self._session.post(
+                _TYPING_URL,
+                json={'platform': 'fluxer', 'channel_id': channel_id},
+                headers=_HEADERS,
+                timeout=aiohttp.ClientTimeout(total=3)
+            ) as resp:
+                if resp.status != 200:
+                    return
+                result = await resp.json()
+        except Exception:
+            return
+
+        for target in result.get('targets', []):
+            if target.get('platform') != 'discord':
+                continue
+            discord_channel_id = str(target.get('channel_id', ''))
+            if not discord_channel_id or not DISCORD_BOT_TOKEN:
+                continue
+            try:
+                async with self._session.post(
+                    f'https://discord.com/api/v10/channels/{discord_channel_id}/typing',
+                    headers={'Authorization': f'Bot {DISCORD_BOT_TOKEN}', 'Content-Length': '0'},
+                    timeout=aiohttp.ClientTimeout(total=3)
+                ) as _:
+                    pass  # best-effort, 204 No Content
+            except Exception as e:
+                logger.debug(f"BridgeCog (Fluxer): Discord typing POST error: {e}")
+
     async def _poll_loop(self):
-        """Poll the hub every 3s for messages; every 6s for reactions."""
+        """Poll the hub every 3s for messages; every 6s for reactions/edits/deletions."""
         await asyncio.sleep(5)  # Wait for bot to be ready
         tick = 0
         while True:
@@ -256,7 +405,7 @@ class BridgeCog(Cog):
             except Exception as e:
                 logger.warning(f"BridgeCog poll error: {e}")
 
-            # Reactions and deletions every other tick (every 6s)
+            # Reactions, deletions, and edits every other tick (every 6s)
             if tick % 2 == 0:
                 try:
                     await self._deliver_pending_reactions()
@@ -266,6 +415,10 @@ class BridgeCog(Cog):
                     await self._deliver_pending_deletions()
                 except Exception as e:
                     logger.warning(f"BridgeCog deletion poll error: {e}")
+                try:
+                    await self._deliver_pending_edits()
+                except Exception as e:
+                    logger.warning(f"BridgeCog edit poll error: {e}")
 
             tick += 1
             await asyncio.sleep(3)
@@ -280,10 +433,11 @@ class BridgeCog(Cog):
                 timeout=aiohttp.ClientTimeout(total=8)
             ) as resp:
                 if resp.status != 200:
+                    logger.warning(f"BridgeCog: pending fetch returned {resp.status} from {_PENDING_URL}")
                     return
                 data = await resp.json()
         except Exception as e:
-            logger.debug(f"BridgeCog: pending fetch error: {e}")
+            logger.warning(f"BridgeCog: pending fetch error: {e}")
             return
 
         messages = data.get('messages', [])
@@ -303,10 +457,8 @@ class BridgeCog(Cog):
                 continue
 
             # Only include the blockquote if we can't do a native reply
-            if reply_quote and not reply_to_event_id:
-                formatted = f"> {reply_quote}\n**[{tag}] {author}:** {content}"
-            else:
-                formatted = f"**[{tag}] {author}:** {content}".rstrip()
+            rq = reply_quote if (reply_quote and not reply_to_event_id) else ''
+            formatted = _format_bridged(tag, author, content, rq)
 
             # Collect attachment files to upload
             attach_files = []
@@ -334,7 +486,11 @@ class BridgeCog(Cog):
                         attach_text_urls.append(url)
 
             if attach_text_urls:
-                formatted = (formatted + '\n' + '\n'.join(attach_text_urls)).strip()
+                # Don't append a URL that is already present in the formatted text
+                # (Discord unfurls link embeds as thumbnails even when the URL is the message content)
+                extra_urls = [u for u in attach_text_urls if u not in formatted]
+                if extra_urls:
+                    formatted = (formatted + '\n' + '\n'.join(extra_urls)).strip()
 
             try:
                 channel = await self.bot.fetch_channel(int(channel_id_str))
@@ -438,6 +594,34 @@ class BridgeCog(Cog):
                 await message.delete()
             except Exception as e:
                 logger.debug(f"BridgeCog: delete message {message_id} failed: {e}")
+
+
+    async def _deliver_pending_edits(self):
+        """Fetch pending edits from hub and edit messages in Fluxer channels."""
+        if not self._session or self._session.closed:
+            return
+        try:
+            async with self._session.get(
+                _PENDING_EDITS_URL, headers=_HEADERS,
+                timeout=aiohttp.ClientTimeout(total=8)
+            ) as resp:
+                if resp.status != 200:
+                    return
+                data = await resp.json()
+        except Exception as e:
+            logger.debug(f"BridgeCog: pending edits fetch error: {e}")
+            return
+
+        for item in data.get('edits', []):
+            message_id = str(item.get('target_message_id', ''))
+            channel_id = str(item.get('target_channel_id', ''))
+            new_content = item.get('new_content', '')
+            if not message_id or not channel_id or not new_content:
+                continue
+            try:
+                await self.bot._http.edit_message(channel_id, message_id, content=new_content)
+            except Exception as e:
+                logger.debug(f"BridgeCog: edit message {message_id} failed: {e}")
 
 
 def setup(bot):
