@@ -14,12 +14,20 @@ from cogs.invite import InviteCog
 from cogs.bridge import BridgeCog
 from cogs.member_sync import MemberSyncCog
 from cogs.welcome import WelcomeCog
+from cogs.reaction_roles import ReactionRolesCog
 from cogs.discovery import DiscoveryCog
 from cogs.rss import RssCog
 from cogs.trackers import TrackersCog
 from cogs.live_alerts import LiveAlertsCog
 from cogs.creators import CreatorsCog
 from cogs.audit import AuditCog
+from cogs.gameserver import GameServerCog
+from cogs.nominations import NominationsCog
+from cogs.legacy import LegacyCog
+from cogs.sdtd import SDTDCog
+from cogs.soulmask import SoulmaskCog
+from cogs.vquest import VQuestCog
+from cogs.activity_tracker import ActivityTrackerCog
 
 intents = fluxer.Intents.default()
 
@@ -44,12 +52,20 @@ async def main():
     await bot.add_cog(BridgeCog(bot))
     await bot.add_cog(MemberSyncCog(bot))
     await bot.add_cog(WelcomeCog(bot))
+    await bot.add_cog(ReactionRolesCog(bot))
     await bot.add_cog(DiscoveryCog(bot))
     await bot.add_cog(RssCog(bot))
     await bot.add_cog(TrackersCog(bot))
     await bot.add_cog(LiveAlertsCog(bot))
     await bot.add_cog(CreatorsCog(bot))
     await bot.add_cog(AuditCog(bot))
+    await bot.add_cog(GameServerCog(bot))
+    await bot.add_cog(NominationsCog(bot))
+    await bot.add_cog(LegacyCog(bot))
+    await bot.add_cog(SDTDCog(bot))
+    await bot.add_cog(SoulmaskCog(bot))
+    await bot.add_cog(VQuestCog(bot))
+    await bot.add_cog(ActivityTrackerCog(bot))
     logger.info("Starting QuestLog Fluxer Bot...")
     await bot.start(token)
 

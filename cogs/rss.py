@@ -126,8 +126,7 @@ def _secure_fetch_sync(url: str) -> Tuple[Optional[Any], Optional[str]]:
                 if not loc:
                     return None, 'Redirect with no Location header'
                 # Re-validate redirect target - prevents SSRF via open redirects
-                _redir, _err = _fetch_rss_feed(loc)
-                # We only need the SSRF check, not a full fetch - validate URL structure
+                # Validate URL structure before following
                 try:
                     redir_parsed = urlparse(loc)
                     if redir_parsed.scheme not in ('http', 'https'):

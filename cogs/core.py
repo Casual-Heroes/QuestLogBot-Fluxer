@@ -111,6 +111,11 @@ class CoreCog(Cog):
         await self._queue_guild_sync(channel)
 
     @Cog.listener()
+    async def on_guild_update(self, data):
+        # Fired by GUILD_UPDATE (raw dict) - catches icon/name changes
+        await self._queue_guild_sync(data)
+
+    @Cog.listener()
     async def on_member_join(self, member):
         await self._queue_guild_sync(member)
 
@@ -175,7 +180,9 @@ class CoreCog(Cog):
         _headers = {'X-Bot-Secret': QUESTLOG_BOT_SECRET}
         while True:
             for guild in list(self.bot.guilds):
-                guild_id = str(guild.id)
+                guild_id = str(guild.id) if guild.id else ''
+                if not guild_id:
+                    continue
                 try:
                     await self._execute_pending_actions(guild, guild_id, _base, _headers)
                 except Exception as e:
@@ -214,6 +221,15 @@ class CoreCog(Cog):
                             'result': {'role_id': str(role.id), 'role_name': role.name},
                         }, headers=headers, timeout=aiohttp.ClientTimeout(total=5))
                     logger.info(f"Created role '{role.name}' in guild {guild_id}")
+                elif action_type == 'sync_guild':
+                    # Full re-sync of channels, roles, members for this guild
+                    await self._sync_single_guild(guild, is_join=False)
+                    async with aiohttp.ClientSession() as session:
+                        await session.post(done_url, json={
+                            'success': True,
+                            'result': {'message': 'Guild synced'},
+                        }, headers=headers, timeout=aiohttp.ClientTimeout(total=5))
+                    logger.info(f"sync_guild action complete for guild {guild_id}")
                 elif action_type == 'check_games':
                     discovery_cog = self.bot.cogs.get('DiscoveryCog')
                     if discovery_cog is None:
@@ -257,6 +273,74 @@ class CoreCog(Cog):
                             'result': {'message': 'Embed sent'},
                         }, headers=headers, timeout=aiohttp.ClientTimeout(total=5))
                     logger.info(f"send_embed action complete for guild {guild_id} channel {channel_id}")
+                elif action_type == 'apply_role_template':
+                    _PERM_BITS = {
+                        'create_instant_invite': 1 << 0, 'kick_members': 1 << 1,
+                        'ban_members': 1 << 2, 'administrator': 1 << 3,
+                        'manage_channels': 1 << 4, 'manage_guild': 1 << 5,
+                        'add_reactions': 1 << 6, 'view_audit_log': 1 << 7,
+                        'priority_speaker': 1 << 8, 'stream': 1 << 9,
+                        'view_channel': 1 << 10, 'send_messages': 1 << 11,
+                        'send_tts_messages': 1 << 12, 'manage_messages': 1 << 13,
+                        'embed_links': 1 << 14, 'attach_files': 1 << 15,
+                        'read_message_history': 1 << 16, 'mention_everyone': 1 << 17,
+                        'use_external_emojis': 1 << 18, 'connect': 1 << 20,
+                        'speak': 1 << 21, 'mute_members': 1 << 22,
+                        'deafen_members': 1 << 23, 'move_members': 1 << 24,
+                        'use_voice_activation': 1 << 25, 'change_nickname': 1 << 26,
+                        'manage_nicknames': 1 << 27, 'manage_roles': 1 << 28,
+                        'manage_webhooks': 1 << 29, 'manage_emojis_and_stickers': 1 << 30,
+                        'use_external_stickers': 1 << 33, 'moderate_members': 1 << 40,
+                        'pin_messages': 1 << 51, 'bypass_slowmode': 1 << 52,
+                    }
+                    roles_created = []
+                    for role_def in payload.get('template_data', []):
+                        perms = 0
+                        for p in (role_def.get('permissions') or []):
+                            perms |= _PERM_BITS.get(p, 0)
+                        color_hex = (role_def.get('color') or '#99aab5').lstrip('#')
+                        color_int = int(color_hex, 16) if color_hex else 0
+                        role = await guild.create_role(
+                            name=role_def.get('name', 'New Role'),
+                            permissions=perms,
+                            color=color_int,
+                            hoist=bool(role_def.get('hoist', False)),
+                            mentionable=bool(role_def.get('mentionable', False)),
+                        )
+                        roles_created.append(role.name)
+                    await self._push_guild_roles_for(guild_id, guild=guild)
+                    async with aiohttp.ClientSession() as session:
+                        await session.post(done_url, json={
+                            'success': True,
+                            'result': {'roles_created': roles_created},
+                        }, headers=headers, timeout=aiohttp.ClientTimeout(total=5))
+                    logger.info(f"apply_role_template: created {len(roles_created)} roles in guild {guild_id}")
+                elif action_type == 'apply_channel_template':
+                    _CHANNEL_TYPES = {'text': 0, 'voice': 2, 'announcement': 5, 'forum': 15, 'stage': 13}
+                    channels_created = []
+                    for cat_def in payload.get('template_data', []):
+                        cat_name = cat_def.get('category_name', 'New Category')
+                        cat_resp = await self.bot._http.create_guild_channel(
+                            guild_id, name=cat_name, type=4
+                        )
+                        cat_id = str(cat_resp.get('id', ''))
+                        channels_created.append(cat_name)
+                        for ch in (cat_def.get('channels') or []):
+                            ch_type = _CHANNEL_TYPES.get(ch.get('type', 'text'), 0)
+                            ch_resp = await self.bot._http.create_guild_channel(
+                                guild_id,
+                                name=ch.get('name', 'new-channel'),
+                                type=ch_type,
+                                topic=ch.get('topic') or None,
+                                parent_id=cat_id if cat_id else None,
+                            )
+                            channels_created.append(ch.get('name', ''))
+                    async with aiohttp.ClientSession() as session:
+                        await session.post(done_url, json={
+                            'success': True,
+                            'result': {'channels_created': channels_created},
+                        }, headers=headers, timeout=aiohttp.ClientTimeout(total=5))
+                    logger.info(f"apply_channel_template: created {len(channels_created)} items in guild {guild_id}")
                 else:
                     logger.warning(f"Unknown action_type '{action_type}' for guild {guild_id}")
                     async with aiohttp.ClientSession() as session:
@@ -302,27 +386,20 @@ class CoreCog(Cog):
         icon = getattr(guild, 'icon', None)
         guild_icon_hash = str(icon) if icon else None
 
-        # owner_id may be absent from GUILD_CREATE payload in Fluxer SDK - fetch via HTTP
-        if not owner_id:
-            try:
-                guild_data = await self.bot._http.get_guild(guild_id)
-                owner_id = str(guild_data.get('owner_id', '') or '')
-                if not guild_name:
-                    guild_name = guild_data.get('name', '') or ''
-                if not guild_icon_hash:
-                    guild_icon_hash = guild_data.get('icon') or None
-            except Exception as e:
-                logger.warning(f"Could not fetch guild {guild_id} via HTTP for owner_id: {e}")
+        # owner_id is not reliably present in GUILD_CREATE payload from Fluxer SDK.
+        # GET /v1/guilds/{id} returns 500 on Fluxer's side - skip the HTTP call to avoid
+        # 5-retry delay on every startup. owner_id will be populated from DB if already stored.
 
         # Member counts
         member_count = getattr(guild, 'member_count', 0) or 0
         # online_count is not reliably available without presence intent - send 0
         online_count = 0
 
-        # Channels - use bot's internal channel cache (bot._channels) which is reliably
-        # populated from GUILD_CREATE events. bot.http.get_guild_channels() returns empty
-        # in the Fluxer SDK for channels that aren't explicitly fetched.
+        # Channels - start from bot._channels cache (populated via GUILD_CREATE/CHANNEL_CREATE),
+        # then supplement with HTTP fetch to catch any channels the cache missed (e.g. created
+        # while the bot was offline).
         channels = []
+        seen_ids: set[str] = set()
         try:
             for ch in self.bot._channels.values():
                 if str(getattr(ch, 'guild_id', None) or '') != guild_id:
@@ -335,24 +412,34 @@ class CoreCog(Cog):
                     'type': int(getattr(ch, 'type', 0) or 0),
                     'category_name': '',
                 })
+                seen_ids.add(ch_id)
         except Exception as e:
             logger.debug(f"Could not read channels from cache for {guild_id}: {e}")
-            # Fallback to HTTP
-            try:
-                ch_data = await self.bot.http.get_guild_channels(guild_id)
-                for ch in (ch_data or []):
-                    ch_id = str(ch.get('id', '') or '')
-                    ch_name = str(ch.get('name', '') or '')
-                    if not ch_id or not ch_name:
-                        continue
-                    channels.append({
-                        'id': ch_id,
-                        'name': ch_name,
-                        'type': int(ch.get('type', 0) or 0),
-                        'category_name': str(ch.get('category_name', '') or ''),
-                    })
-            except Exception as e2:
-                logger.debug(f"HTTP channel fetch also failed for {guild_id}: {e2}")
+
+        # Also try HTTP to catch channels not in the cache
+        try:
+            ch_data = await self.bot.http.get_guild_channels(guild_id)
+            for ch in (ch_data or []):
+                ch_id = str(ch.get('id', '') or '')
+                ch_name = str(ch.get('name', '') or '')
+                if not ch_id or not ch_name or ch_id in seen_ids:
+                    continue
+                channels.append({
+                    'id': ch_id,
+                    'name': ch_name,
+                    'type': int(ch.get('type', 0) or 0),
+                    'category_name': str(ch.get('category_name', '') or ''),
+                })
+                seen_ids.add(ch_id)
+                # Also update the local cache so future event-triggered syncs are accurate
+                from fluxer.models.channel import Channel as FluxerChannel
+                try:
+                    fc = FluxerChannel.from_data(ch, self.bot._http)
+                    self.bot._channels[fc.id] = fc
+                except Exception:
+                    pass
+        except Exception as e2:
+            logger.debug(f"HTTP channel fetch failed for {guild_id}: {e2}")
 
         # Emojis
         emojis = []
@@ -412,7 +499,8 @@ class CoreCog(Cog):
             except Exception as e:
                 logger.debug(f"fetch_members() also failed for {guild_id}: {e}")
 
-        if member_count == 0 and members:
+        # Prefer actual fetched member count if it's higher (Fluxer SDK guild.member_count can be stale)
+        if members and len(members) > member_count:
             member_count = len(members)
 
         # Roles (also sync via the existing guild-roles endpoint)
@@ -559,38 +647,133 @@ class CoreCog(Cog):
 
     @Cog.command()
     async def help(self, ctx):
-        """!help - Show available commands."""
+        """!help - Show member commands."""
         embed = fluxer.Embed(
-            title="QuestLog Bot - Commands",
-            description="Your gaming community companion.",
+            title="QuestLog Bot - Member Commands",
+            description="Your gaming community companion on Fluxer.",
             color=BRAND_COLOR,
             url="https://casual-heroes.com/ql/",
         )
+
         embed.add_field(
             name="General",
-            value="`!ping` - Check bot status\n`!help` - This menu\n`!info` - About QuestLog Bot",
-            inline=False,
-        )
-        embed.add_field(
-            name="XP & Levels",
-            value="`!xp` - Your XP and level\n`!leaderboard` - Top 10 members",
-            inline=False,
-        )
-        embed.add_field(
-            name="Looking for Group",
-            value="`!lfg` - Browse this server's LFG\n`!lfgql` - QuestLog Network LFG\n`!lfglist` - Active LFG posts\n`!lfgjoin <id>` - Join a group\n`!lfg delete <id>` - Delete your group",
-            inline=False,
-        )
-        embed.add_field(
-            name="Moderation (Mods only)",
             value=(
-                "`!ban @user [reason]` - Permanent ban\n"
-                "`!tempban @user <hours> [reason]` - Temp ban\n"
-                "`!kick @user [reason]` - Kick\n"
-                "`!timeout @user <minutes> [reason]` - Timeout"
+                "`!ping` - Check bot status\n"
+                "`!help` - This menu\n"
+                "`!info` - About QuestLog Bot\n"
+                "`!invite` - Get an invite link to this server"
             ),
             inline=False,
         )
+
+        embed.add_field(
+            name="XP & Levels",
+            value=(
+                "`!xp` - Your XP, level, and rank\n"
+                "`!leaderboard` - Top 10 members by XP\n"
+                "`!heroshop` - Browse and buy flairs with Hero Points"
+            ),
+            inline=False,
+        )
+
+        embed.add_field(
+            name="Looking for Group",
+            value=(
+                "`!lfg` - Post or browse this server's LFG groups\n"
+                "`!lfgql` - Browse the full QuestLog Network LFG\n"
+                "`!lfglist` - List active LFG groups in this server\n"
+                "`!lfgjoin <id>` - Join a LFG group by ID\n"
+                "`!lfg delete <id>` - Delete your own LFG group"
+            ),
+            inline=False,
+        )
+
+        embed.add_field(
+            name="Creator Features",
+            value=(
+                "`!raffle` - Enter the active raffle (if running)\n"
+                "`!cotw` - See the current Creator of the Week\n"
+                "`!cotm` - See the current Creator of the Month"
+            ),
+            inline=False,
+        )
+
+        embed.add_field(
+            name="Game Servers",
+            value=(
+                "`!gs_status` - Status of all game servers\n"
+                "`!gs_players` - Who is online across all servers"
+            ),
+            inline=False,
+        )
+
+        embed.set_footer(text="Server staff: use !admin_help for admin commands - casual-heroes.com/ql/")
+        await ctx.reply(embed=embed)
+
+    @Cog.command()
+    async def admin_help(self, ctx):
+        """!admin_help - Show staff commands based on your permission level."""
+        from cogs.permissions import is_administrator, is_moderator, is_bot_manager
+        try:
+            can_admin = await is_administrator(ctx)
+            can_mod   = await is_moderator(ctx)
+            can_gs    = await is_bot_manager(ctx)
+        except Exception:
+            can_admin = can_mod = can_gs = False
+
+        if not (can_admin or can_mod or can_gs):
+            deny = fluxer.Embed(description='You do not have permission to view admin commands.', color=0xFF4444)
+            await ctx.reply(embed=deny)
+            return
+
+        embed = fluxer.Embed(
+            title="QuestLog Bot - Staff Commands",
+            description="Showing commands available to your permission level.",
+            color=BRAND_COLOR,
+            url="https://casual-heroes.com/ql/",
+        )
+
+        # Game server commands - Bot Manager role, Manage Messages, or Administrator
+        if can_gs or can_mod or can_admin:
+            embed.add_field(
+                name="Game Servers",
+                value=(
+                    "`!gs_serverinfo <instance>` - Post/refresh live pinned server panel\n"
+                    "`!gs_start <instance>` - Start a game server\n"
+                    "`!gs_stop <instance>` - Stop a game server\n"
+                    "`!gs_restart <instance>` - Restart a game server\n"
+                    "`!gs_backup <instance>` - Trigger a backup\n"
+                    "\nExample: `!gs_start CH-VRising01`"
+                ),
+                inline=False,
+            )
+
+        # Moderation commands - Manage Messages or Administrator
+        if can_mod or can_admin:
+            embed.add_field(
+                name="Moderation",
+                value=(
+                    "`!ban @user [reason]` - Permanent ban\n"
+                    "`!tempban @user <hours> [reason]` - Temporary ban\n"
+                    "`!kick @user [reason]` - Kick member\n"
+                    "`!timeout @user <minutes> [reason]` - Timeout member"
+                ),
+                inline=False,
+            )
+
+        # Admin-only commands - Administrator only
+        if can_admin:
+            embed.add_field(
+                name="Admin / Owner Only",
+                value=(
+                    "`!setup` - Configure bot settings for this server\n"
+                    "`!checkgames` - Force-run game discovery now\n"
+                    "`!refreshtrackers` - Force-refresh game activity trackers\n"
+                    "`!checkrss` - Force-run all RSS feeds now"
+                ),
+                inline=False,
+            )
+
         embed.set_footer(text="Full platform: casual-heroes.com/ql/")
         await ctx.reply(embed=embed)
 

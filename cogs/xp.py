@@ -122,8 +122,11 @@ def _get_boost_multiplier(guild_id: str, db) -> int:
 
 # XP amounts - must match XP_ACTIONS in helpers.py on the site
 FLUXER_XP = {
-    'fluxer_message':  2,
-    'fluxer_reaction': 1,
+    'fluxer_message':    2,
+    'fluxer_reaction':   1,
+    # 7DTD in-game events - unified XP, mirrors XP_ACTIONS in helpers.py
+    '7dtd_boss_kill':    75,
+    '7dtd_boss_assist':  25,
 }
 
 # HP conversion constants - must match helpers.py
@@ -249,6 +252,99 @@ def _award_web_xp(fluxer_user_id: str, action_type: str, ref_id: str) -> tuple[b
     return False, 0
 
 
+def _award_web_legacy(fluxer_user_id: str, action_type: str, ref_id: str, source: str = 'fluxer') -> int:
+    """
+    Award Legacy points to the unified QuestLog profile for a linked Fluxer user.
+    Mirrors _award_web_xp() pattern exactly.
+    Returns points awarded (0 if not linked, duplicate, or unknown action).
+    """
+    if not ref_id:
+        logger.error(f"_award_web_legacy called without ref_id for action={action_type}, refusing")
+        return 0
+    try:
+        with db_session_scope() as db:
+            row = db.execute(
+                text("SELECT id FROM web_users WHERE fluxer_id = :fid AND is_banned = 0 LIMIT 1"),
+                {"fid": fluxer_user_id},
+            ).fetchone()
+            if not row:
+                return 0  # Not linked or banned
+
+            web_user_id = row[0]
+
+            # Dedup check
+            dup = db.execute(
+                text(
+                    "SELECT id FROM web_legacy_events "
+                    "WHERE user_id = :uid AND action_type = :at AND ref_id = :ref LIMIT 1"
+                ),
+                {"uid": web_user_id, "at": action_type, "ref": ref_id},
+            ).fetchone()
+            if dup:
+                return 0
+
+            # Points table mirrors LEGACY_ACTIONS in helpers.py
+            POINTS = {
+                'lfg_group_filled':    10,
+                'lfg_completed':       15,
+                'comment_helpful':      5,
+                'clean_record_30d':    10,
+                'clean_record_60d':    15,
+                'clean_record_90d':    20,
+                'report_upheld':      -20,
+                'temp_ban':           -50,
+                # 7DTD boss events
+                'ingame_boss_kill':    50,
+                'ingame_boss_assist':  15,
+                'ingame_boss_solo_kill': 100,
+                # loyalty_grant uses a variable amount - awarded directly by the migration script
+            }
+            pts = POINTS.get(action_type)
+            if pts is None:
+                logger.warning(f"_award_web_legacy: unknown action_type '{action_type}'")
+                return 0
+
+            now = int(time.time())
+            db.execute(
+                text(
+                    "INSERT INTO web_legacy_events "
+                    "(user_id, action_type, points, source, ref_id, created_at) "
+                    "VALUES (:uid, :at, :pts, :src, :ref, :now)"
+                ),
+                {"uid": web_user_id, "at": action_type, "pts": pts, "src": source, "ref": ref_id, "now": now},
+            )
+            db.execute(
+                text("UPDATE web_users SET legacy_score = GREATEST(0, legacy_score + :pts) WHERE id = :uid"),
+                {"pts": pts, "uid": web_user_id},
+            )
+            # Recalculate tier
+            score_row = db.execute(
+                text("SELECT legacy_score FROM web_users WHERE id = :uid"), {"uid": web_user_id}
+            ).fetchone()
+            if score_row:
+                score = score_row[0] or 0
+                if score >= 25000:
+                    tier = 5
+                elif score >= 7500:
+                    tier = 4
+                elif score >= 2000:
+                    tier = 3
+                elif score >= 500:
+                    tier = 2
+                else:
+                    tier = 1
+                db.execute(
+                    text("UPDATE web_users SET legacy_tier = :tier WHERE id = :uid"),
+                    {"tier": tier, "uid": web_user_id},
+                )
+            db.commit()
+            logger.info(f"_award_web_legacy: user {web_user_id} +{pts} for {action_type} ref={ref_id}")
+            return pts
+    except Exception as e:
+        logger.warning(f"_award_web_legacy failed for fluxer_id={fluxer_user_id}: {e}")
+    return 0
+
+
 BRAND_COLOR = 0x66aa8b  # Fluxer green
 GOLD_COLOR = 0xFEE75C
 
@@ -287,20 +383,30 @@ def _check_cmd_cooldown(cmd: str, user_id: str) -> bool:
 MEDALS = {1: "🥇", 2: "🥈", 3: "🥉"}
 
 
+def _xp_threshold(level: int) -> int:
+    """Cumulative XP required to reach a given level. Matches level_requirements table."""
+    if level <= 1:
+        return 0
+    total = 0
+    for i in range(1, level):
+        total += int(7 * ((i + 1) ** 1.5))
+    return total
+
+
 def _xp_to_level(xp: float) -> int:
-    """Calculate level from XP using the same formula as the site and WardenBot: 7*(level+1)^1.5"""
+    """Calculate level from total XP using cumulative thresholds. Matches level_requirements table."""
     level = 1
     while level < 99:
-        if int(xp) < int(7 * ((level + 1) ** 1.5)):
+        if int(xp) < _xp_threshold(level + 1):
             break
         level += 1
     return level
 
 
 def _xp_bar(xp: float, level: int) -> str:
-    """Visual XP progress bar. Uses same formula as site: 7*(level+1)^1.5"""
-    level_start = int(7 * (level ** 1.5)) if level > 1 else 0
-    level_end = int(7 * ((level + 1) ** 1.5))
+    """Visual XP progress bar. Uses cumulative thresholds matching level_requirements table."""
+    level_start = _xp_threshold(level)
+    level_end = _xp_threshold(level + 1)
     progress = max(0, xp - level_start)
     total = max(1, level_end - level_start)
     pct = min(1.0, progress / total)
@@ -535,12 +641,16 @@ class XpCog(Cog):
             logger.error(f"Failed to award bot XP: {e}", exc_info=True)
 
         # Also award to unified web profile if user has linked their QuestLog account.
-        # If the unified web level went up (and guild local didn't already trigger one),
-        # surface a level-up so the user still gets notified on Fluxer.
+        # If the user IS linked: suppress the local bot level-up entirely and only
+        # announce when the unified web level changes - prevents double notifications.
+        # If the user is NOT linked: fall through to the local level-up as before.
         web_leveled_up, web_new_level = _award_web_xp(user_id, 'fluxer_message', ref_id)
-        if web_leveled_up and not leveled_up:
-            leveled_up = True
+        if web_new_level > 0:
+            # User is linked - unified web level is authoritative
+            # Only fire a level-up notification if the unified web level actually changed
+            leveled_up = web_leveled_up
             new_level = web_new_level
+        # If web_new_level == 0, user is not linked - local leveled_up/new_level stand as-is
         return leveled_up, new_level
 
     async def _apply_level_roles(self, guild_id: str, user_id: str, new_level: int, db):

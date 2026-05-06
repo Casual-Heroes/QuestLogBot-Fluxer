@@ -76,15 +76,24 @@ class FlairSyncCog(Cog):
             db.commit()
 
     async def _apply_flair_update(self, web_user_id: int, action: str, flair_emoji: str, flair_name: str):
-        """Apply flair role change across all guilds the bot shares with this user."""
+        """Apply flair role change across all guilds that have opted in to flair sync."""
         # Look up fluxer_id from linked QuestLog account
         with db_session_scope() as db:
             result = db.execute(text(
                 "SELECT fluxer_id FROM web_users WHERE id = :uid AND fluxer_id IS NOT NULL"
             ), {'uid': web_user_id}).fetchone()
 
-        if not result or not result[0]:
-            return  # User hasn't linked their Fluxer account
+            if not result or not result[0]:
+                return  # User hasn't linked their Fluxer account
+
+            # Fetch all guilds that have opted in to flair sync
+            opted_in = db.execute(text(
+                "SELECT guild_id FROM web_fluxer_guild_settings WHERE flair_sync_enabled = 1"
+            )).fetchall()
+            opted_in_ids = {int(row[0]) for row in opted_in}
+
+        if not opted_in_ids:
+            return
 
         fluxer_user_id = int(result[0])
         http = self.bot._http if hasattr(self.bot, '_http') else None
@@ -93,6 +102,8 @@ class FlairSyncCog(Cog):
             return
 
         for guild in self.bot.guilds:
+            if guild.id not in opted_in_ids:
+                continue  # Guild has not opted in - skip
             try:
                 await self._sync_guild_flair(http, guild.id, fluxer_user_id, action, flair_emoji, flair_name)
             except Exception as e:

@@ -14,6 +14,7 @@
 #   on_message_delete_bulk(data)  - raw dict: {ids, channel_id, guild_id}
 
 import time
+from datetime import datetime
 from collections import OrderedDict
 
 import fluxer
@@ -66,6 +67,11 @@ EMBED_COLORS = {
     'channels':   0xA855F7,
     'messages':   0x6B7280,
 }
+
+# Severity-based color overrides (matches Discord bot 1:1)
+_SEVERITY_RED    = {'member_ban', 'member_kick', 'raid_detected', 'lockdown_activated'}
+_SEVERITY_GREEN  = {'member_join', 'verification_passed', 'member_unban', 'lockdown_deactivated'}
+_SEVERITY_ORANGE = {'member_leave', 'message_delete'}
 
 
 def _user_tag(user_data):
@@ -136,29 +142,61 @@ class AuditCog(Cog):
             return
 
         if channel_id:
-            await self._send_embed(channel_id, action, actor_name=actor_name,
-                                   target_name=target_name, reason=reason, details=details)
+            await self._send_embed(
+                channel_id, action,
+                actor_id=actor_id, actor_name=actor_name,
+                target_id=target_id, target_name=target_name,
+                target_type=target_type, reason=reason, details=details,
+            )
 
-    async def _send_embed(self, channel_id, action, actor_name=None, target_name=None,
+    async def _send_embed(self, channel_id, action, actor_id=None, actor_name=None,
+                          target_id=None, target_name=None, target_type=None,
                           reason=None, details=None):
-        category = ACTION_CATEGORIES.get(action, 'other')
-        color = EMBED_COLORS.get(category, 0x6B7280)
-        emoji = ACTION_EMOJIS.get(action, '•')
-        label = ACTION_LABELS.get(action, action)
+        # Severity-based color (matches Discord bot)
+        if action in _SEVERITY_RED:
+            color = 0xEF4444
+        elif action in _SEVERITY_GREEN:
+            color = 0x22C55E
+        elif action in _SEVERITY_ORANGE:
+            color = 0xF97316
+        else:
+            category = ACTION_CATEGORIES.get(action, 'other')
+            color = EMBED_COLORS.get(category, 0x6B7280)
+
+        emoji = ACTION_EMOJIS.get(action, '📋')
+        label = ACTION_LABELS.get(action, action.replace('_', ' ').title())
 
         embed = fluxer.Embed(title=f"{emoji} {label}", color=color)
+
+        # Actor field - name + mention
         if actor_name:
-            embed.add_field(name="Actor", value=str(actor_name), inline=True)
+            actor_val = actor_name
+            if actor_id:
+                actor_val += f"\n(<@{actor_id}>)"
+            embed.add_field(name="Actor", value=actor_val, inline=True)
+
+        # Target field - type-aware formatting
         if target_name:
-            embed.add_field(name="Target", value=str(target_name), inline=True)
+            if target_type == 'user' and target_id:
+                target_val = f"{target_name}\n(<@{target_id}>)"
+            elif target_type == 'role' and target_id:
+                target_val = f"{target_name}\n(<@&{target_id}>)"
+            elif target_type == 'channel' and target_id:
+                target_val = f"{target_name}\n(<#{target_id}>)"
+            else:
+                target_val = target_name
+            embed.add_field(name="Target", value=target_val, inline=True)
+
         if reason:
-            embed.add_field(name="Reason", value=str(reason)[:512], inline=False)
+            embed.add_field(name="Reason", value=str(reason)[:1024], inline=False)
         if details:
-            embed.add_field(name="Details", value=str(details)[:512], inline=False)
+            embed.add_field(name="Details", value=str(details)[:1024], inline=False)
+
         embed.set_footer(text="QuestLog Audit")
+        embed.timestamp = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%S.000Z')
 
         try:
-            await self.bot._http.send_message(str(channel_id), embed=embed)
+            await self.bot._http.send_message(str(channel_id), embeds=[embed])
         except Exception as e:
             logger.warning(f"AuditCog: send_message failed for channel {channel_id}: {e}")
 
@@ -173,10 +211,20 @@ class AuditCog(Cog):
             user = data.get('user', data)
             if not guild_id or user.get('bot'):
                 return
+            user_id = str(user.get('id', ''))
+            # Estimate account creation from Discord snowflake ID
+            details = None
+            try:
+                if user_id:
+                    created_ts = (int(user_id) >> 22) // 1000 + 1420070400
+                    details = f"Account created: <t:{created_ts}:R>"
+            except Exception:
+                pass
             await self._record(
                 guild_id=guild_id, action='member_join',
-                target_id=str(user.get('id', '')),
+                target_id=user_id,
                 target_name=_user_tag(user), target_type='user',
+                details=details,
             )
         except Exception as e:
             logger.error(f"AuditCog on_member_join: {e}")
@@ -188,10 +236,24 @@ class AuditCog(Cog):
             user = data.get('user', data)
             if not guild_id:
                 return
+            user_id = str(user.get('id', ''))
+            target_name = _user_tag(user)
+            # If Fluxer didn't include name fields in the payload, fall back to DB
+            if target_name == 'Unknown' and user_id:
+                try:
+                    with db_session_scope() as db:
+                        row = db.execute(
+                            text("SELECT username FROM web_fluxer_members WHERE guild_id=:g AND user_id=:u LIMIT 1"),
+                            {'g': guild_id, 'u': user_id}
+                        ).fetchone()
+                        if row and row[0]:
+                            target_name = row[0]
+                except Exception:
+                    pass
             await self._record(
                 guild_id=guild_id, action='member_leave',
-                target_id=str(user.get('id', '')),
-                target_name=_user_tag(user), target_type='user',
+                target_id=user_id,
+                target_name=target_name, target_type='user',
             )
         except Exception as e:
             logger.error(f"AuditCog on_member_remove: {e}")
@@ -392,9 +454,9 @@ class AuditCog(Cog):
             if log_channel:
                 await self._send_embed(
                     log_channel, 'message_delete',
-                    actor_name=actor_name,
-                    target_name=target_name,
-                    details=channel_name,
+                    actor_id=actor_id, actor_name=actor_name,
+                    target_name=target_name, target_type='message',
+                    details=f"Channel: <#{channel_id}>\nContent: {content_snippet or '(unknown)'}",
                 )
         except Exception as e:
             logger.error(f"AuditCog on_message_delete: {e}")

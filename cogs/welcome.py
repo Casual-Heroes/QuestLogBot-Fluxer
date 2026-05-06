@@ -174,6 +174,9 @@ class WelcomeCog(Cog):
 
     def __init__(self, bot):
         super().__init__(bot)
+        # Dedup: track (guild_id, user_id) -> timestamp to prevent double-fire
+        self._recent_joins: dict[tuple, float] = {}
+        self._JOIN_DEDUP_WINDOW = 10  # seconds
 
     # -------------------------------------------------------------------------
     # on_member_join
@@ -189,6 +192,18 @@ class WelcomeCog(Cog):
                 return
             if user_data.get('bot'):
                 return
+
+            # Deduplicate: Fluxer can fire GUILD_MEMBER_ADD twice on reconnect
+            key = (guild_id, user_id)
+            now_ts = time.time()
+            if now_ts - self._recent_joins.get(key, 0) < self._JOIN_DEDUP_WINDOW:
+                logger.debug(f"WelcomeCog: dedup suppressed duplicate join for {user_id} in {guild_id}")
+                return
+            self._recent_joins[key] = now_ts
+            # Prune old entries to avoid unbounded growth
+            if len(self._recent_joins) > 500:
+                cutoff = now_ts - self._JOIN_DEDUP_WINDOW * 2
+                self._recent_joins = {k: v for k, v in self._recent_joins.items() if v > cutoff}
 
             username = user_data.get('global_name') or user_data.get('username') or 'Unknown'
             avatar_hash = user_data.get('avatar')
@@ -301,13 +316,30 @@ class WelcomeCog(Cog):
         try:
             guild_id = str(data.get('guild_id') or '')
             user_data = data.get('user') or {}
-            user_id = str(user_data.get('id') or '')
+            user_id = str(user_data.get('id') or data.get('id') or '')
             if not guild_id or not user_id:
                 return
-            if user_data.get('bot'):
+            if user_data.get('bot') or data.get('bot'):
                 return
 
-            username = user_data.get('global_name') or user_data.get('username') or 'Unknown'
+            logger.debug(f"WelcomeCog on_member_remove raw data keys: {list(data.keys())} user_data={user_data}")
+
+            # Try nested user object first, then top-level fields, then fall back to DB
+            username = (
+                user_data.get('global_name') or user_data.get('username')
+                or data.get('global_name') or data.get('username')
+            )
+            if not username:
+                # Last resort: look up from our member sync table
+                try:
+                    with db_session_scope() as db:
+                        row = db.execute(
+                            text("SELECT username FROM web_fluxer_members WHERE guild_id=:g AND user_id=:u LIMIT 1"),
+                            {'g': guild_id, 'u': user_id}
+                        ).fetchone()
+                        username = row[0] if row and row[0] else f"User {user_id}"
+                except Exception:
+                    username = f"User {user_id}"
 
             # --- Role persistence: save roles before member record is gone ---
             if _role_persistence_enabled(guild_id):

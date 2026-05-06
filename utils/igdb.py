@@ -77,7 +77,7 @@ class IGDBGame:
     websites: List[Dict[str, str]] = field(default_factory=list)  # Website info (category, url)
 
 
-async def get_twitch_token() -> Optional[str]:
+async def get_twitch_token(force_refresh: bool = False) -> Optional[str]:
     """Get or refresh Twitch OAuth token for IGDB API access."""
     global _token_cache
 
@@ -85,9 +85,13 @@ async def get_twitch_token() -> Optional[str]:
         logger.warning("Twitch credentials not configured. IGDB search disabled.")
         return None
 
-    # Check if we have a valid cached token
-    if _token_cache["access_token"] and time.time() < _token_cache["expires_at"]:
+    # Check if we have a valid cached token (skip check if force_refresh)
+    if not force_refresh and _token_cache["access_token"] and time.time() < _token_cache["expires_at"]:
         return _token_cache["access_token"]
+
+    # Clear stale token before fetching a new one
+    _token_cache["access_token"] = None
+    _token_cache["expires_at"] = 0
 
     try:
         async with aiohttp.ClientSession() as session:
@@ -116,6 +120,47 @@ async def get_twitch_token() -> Optional[str]:
         return None
 
 
+async def _igdb_post(endpoint: str, body: str) -> Optional[Any]:
+    """
+    POST to an IGDB endpoint, retrying once with a fresh token on 401.
+
+    Returns parsed JSON on success, None on failure.
+    """
+    for attempt in range(2):
+        token = await get_twitch_token(force_refresh=(attempt > 0))
+        if not token:
+            return None
+
+        await _rate_limit()
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                headers = {
+                    "Client-ID": TWITCH_CLIENT_ID,
+                    "Authorization": f"Bearer {token}",
+                    "Accept": "application/json"
+                }
+                async with session.post(
+                    f"{IGDB_API_URL}/{endpoint}",
+                    headers=headers,
+                    data=body
+                ) as response:
+                    if response.status == 401 and attempt == 0:
+                        logger.warning("IGDB returned 401 - token may have been revoked, refreshing and retrying")
+                        continue
+                    if response.status != 200:
+                        text = await response.text()
+                        logger.error(f"IGDB {endpoint} failed: {response.status}")
+                        logger.error(f"Response: {text}")
+                        return None
+                    return await response.json()
+        except Exception as e:
+            logger.error(f"Error calling IGDB {endpoint}: {e}")
+            return None
+
+    return None
+
+
 async def search_games(query: str, limit: int = 10) -> List[IGDBGame]:
     """
     Search for games on IGDB.
@@ -127,76 +172,50 @@ async def search_games(query: str, limit: int = 10) -> List[IGDBGame]:
     Returns:
         List of IGDBGame objects
     """
-    token = await get_twitch_token()
-    if not token:
-        return []
-
-    await _rate_limit()  # Enforce rate limiting
+    # NOTE: Removed category = 0 filter - many games don't have this field set in IGDB
+    body = f'''
+        search "{query}";
+        fields name, slug, cover.image_id, platforms.abbreviation, summary, first_release_date;
+        limit {limit};
+    '''
 
     try:
-        async with aiohttp.ClientSession() as session:
-            headers = {
-                "Client-ID": TWITCH_CLIENT_ID,
-                "Authorization": f"Bearer {token}",
-                "Accept": "application/json"
-            }
+        data = await _igdb_post("games", body)
+        if data is None:
+            return []
+        games = []
 
-            # IGDB uses a custom query language
-            # NOTE: Removed category = 0 filter - many games don't have this field set in IGDB
-            body = f'''
-                search "{query}";
-                fields name, slug, cover.image_id, platforms.abbreviation, summary, first_release_date;
-                limit {limit};
-            '''
+        for game_data in data:
+            cover_url = None
+            if "cover" in game_data and game_data["cover"]:
+                image_id = game_data["cover"].get("image_id")
+                if image_id:
+                    cover_url = f"https://images.igdb.com/igdb/image/upload/t_cover_big/{image_id}.jpg"
 
-            async with session.post(
-                f"{IGDB_API_URL}/games",
-                headers=headers,
-                data=body
-            ) as response:
-                if response.status != 200:
-                    logger.error(f"IGDB search failed: {response.status}")
-                    return []
+            platforms = []
+            if "platforms" in game_data:
+                for platform in game_data["platforms"]:
+                    abbr = platform.get("abbreviation")
+                    if abbr:
+                        platforms.append(abbr)
 
-                data = await response.json()
-                games = []
+            release_year = None
+            if "first_release_date" in game_data:
+                import datetime
+                ts = game_data["first_release_date"]
+                release_year = datetime.datetime.fromtimestamp(ts).year
 
-                for game_data in data:
-                    # Build cover URL
-                    cover_url = None
-                    if "cover" in game_data and game_data["cover"]:
-                        image_id = game_data["cover"].get("image_id")
-                        if image_id:
-                            # t_cover_big = 264x374
-                            cover_url = f"https://images.igdb.com/igdb/image/upload/t_cover_big/{image_id}.jpg"
+            games.append(IGDBGame(
+                id=game_data["id"],
+                name=game_data["name"],
+                slug=game_data.get("slug", ""),
+                cover_url=cover_url,
+                platforms=platforms,
+                summary=game_data.get("summary"),
+                release_year=release_year
+            ))
 
-                    # Extract platform abbreviations
-                    platforms = []
-                    if "platforms" in game_data:
-                        for platform in game_data["platforms"]:
-                            abbr = platform.get("abbreviation")
-                            if abbr:
-                                platforms.append(abbr)
-
-                    # Extract release year
-                    release_year = None
-                    if "first_release_date" in game_data:
-                        import datetime
-                        ts = game_data["first_release_date"]
-                        release_year = datetime.datetime.fromtimestamp(ts).year
-
-                    game = IGDBGame(
-                        id=game_data["id"],
-                        name=game_data["name"],
-                        slug=game_data.get("slug", ""),
-                        cover_url=cover_url,
-                        platforms=platforms,
-                        summary=game_data.get("summary"),
-                        release_year=release_year
-                    )
-                    games.append(game)
-
-                return games
+        return games
 
     except Exception as e:
         logger.error(f"Error searching IGDB: {e}")
@@ -205,70 +224,46 @@ async def search_games(query: str, limit: int = 10) -> List[IGDBGame]:
 
 async def get_game_by_id(game_id: int) -> Optional[IGDBGame]:
     """Get a specific game by IGDB ID."""
-    token = await get_twitch_token()
-    if not token:
-        return None
-
-    await _rate_limit()  # Enforce rate limiting
+    body = f'''
+        fields name, slug, cover.image_id, platforms.abbreviation, summary, first_release_date;
+        where id = {game_id};
+    '''
 
     try:
-        async with aiohttp.ClientSession() as session:
-            headers = {
-                "Client-ID": TWITCH_CLIENT_ID,
-                "Authorization": f"Bearer {token}",
-                "Accept": "application/json"
-            }
+        data = await _igdb_post("games", body)
+        if not data:
+            return None
 
-            body = f'''
-                fields name, slug, cover.image_id, platforms.abbreviation, summary, first_release_date;
-                where id = {game_id};
-            '''
+        game_data = data[0]
 
-            async with session.post(
-                f"{IGDB_API_URL}/games",
-                headers=headers,
-                data=body
-            ) as response:
-                if response.status != 200:
-                    return None
+        cover_url = None
+        if "cover" in game_data and game_data["cover"]:
+            image_id = game_data["cover"].get("image_id")
+            if image_id:
+                cover_url = f"https://images.igdb.com/igdb/image/upload/t_cover_big/{image_id}.jpg"
 
-                data = await response.json()
-                if not data:
-                    return None
+        platforms = []
+        if "platforms" in game_data:
+            for platform in game_data["platforms"]:
+                abbr = platform.get("abbreviation")
+                if abbr:
+                    platforms.append(abbr)
 
-                game_data = data[0]
+        release_year = None
+        if "first_release_date" in game_data:
+            import datetime
+            ts = game_data["first_release_date"]
+            release_year = datetime.datetime.fromtimestamp(ts).year
 
-                # Build cover URL
-                cover_url = None
-                if "cover" in game_data and game_data["cover"]:
-                    image_id = game_data["cover"].get("image_id")
-                    if image_id:
-                        cover_url = f"https://images.igdb.com/igdb/image/upload/t_cover_big/{image_id}.jpg"
-
-                # Extract platform abbreviations
-                platforms = []
-                if "platforms" in game_data:
-                    for platform in game_data["platforms"]:
-                        abbr = platform.get("abbreviation")
-                        if abbr:
-                            platforms.append(abbr)
-
-                # Extract release year
-                release_year = None
-                if "first_release_date" in game_data:
-                    import datetime
-                    ts = game_data["first_release_date"]
-                    release_year = datetime.datetime.fromtimestamp(ts).year
-
-                return IGDBGame(
-                    id=game_data["id"],
-                    name=game_data["name"],
-                    slug=game_data.get("slug", ""),
-                    cover_url=cover_url,
-                    platforms=platforms,
-                    summary=game_data.get("summary"),
-                    release_year=release_year
-                )
+        return IGDBGame(
+            id=game_data["id"],
+            name=game_data["name"],
+            slug=game_data.get("slug", ""),
+            cover_url=cover_url,
+            platforms=platforms,
+            summary=game_data.get("summary"),
+            release_year=release_year
+        )
 
     except Exception as e:
         logger.error(f"Error getting game from IGDB: {e}")
@@ -277,79 +272,54 @@ async def get_game_by_id(game_id: int) -> Optional[IGDBGame]:
 
 async def get_game_full_details(game_id: int) -> Optional[IGDBGame]:
     """Get full game details including genres, themes, keywords from IGDB."""
-    token = await get_twitch_token()
-    if not token:
-        return None
-
-    await _rate_limit()
+    body = f'''
+        fields name, slug, cover.image_id, platforms.name, summary,
+               first_release_date, genres.name, themes.name, keywords.name,
+               game_modes.name, rating, hypes, url;
+        where id = {game_id};
+    '''
 
     try:
-        async with aiohttp.ClientSession() as session:
-            headers = {
-                "Client-ID": TWITCH_CLIENT_ID,
-                "Authorization": f"Bearer {token}",
-                "Accept": "application/json"
-            }
+        data = await _igdb_post("games", body)
+        if not data:
+            return None
 
-            body = f'''
-                fields name, slug, cover.image_id, platforms.name, summary,
-                       first_release_date, genres.name, themes.name, keywords.name,
-                       game_modes.name, rating, hypes, url;
-                where id = {game_id};
-            '''
+        game_data = data[0]
 
-            async with session.post(
-                f"{IGDB_API_URL}/games",
-                headers=headers,
-                data=body
-            ) as response:
-                if response.status != 200:
-                    logger.error(f"IGDB full details lookup failed: {response.status}")
-                    return None
+        cover_url = None
+        if "cover" in game_data and game_data["cover"]:
+            image_id = game_data["cover"].get("image_id")
+            if image_id:
+                cover_url = f"https://images.igdb.com/igdb/image/upload/t_cover_big/{image_id}.jpg"
 
-                data = await response.json()
-                if not data:
-                    return None
+        platforms_list = [p.get("name") for p in game_data.get("platforms", []) if p.get("name")]
+        genres_list = [g.get("name") for g in game_data.get("genres", []) if g.get("name")]
+        themes_list = [t.get("name") for t in game_data.get("themes", []) if t.get("name")]
+        keywords_list = [k.get("name") for k in game_data.get("keywords", []) if k.get("name")]
+        modes_list = [m.get("name") for m in game_data.get("game_modes", []) if m.get("name")]
 
-                game_data = data[0]
+        release_date = game_data.get("first_release_date")
+        release_year = None
+        if release_date:
+            import datetime
+            release_year = datetime.datetime.fromtimestamp(release_date).year
 
-                # Build cover URL
-                cover_url = None
-                if "cover" in game_data and game_data["cover"]:
-                    image_id = game_data["cover"].get("image_id")
-                    if image_id:
-                        cover_url = f"https://images.igdb.com/igdb/image/upload/t_cover_big/{image_id}.jpg"
-
-                # Extract lists
-                platforms_list = [p.get("name") for p in game_data.get("platforms", []) if p.get("name")]
-                genres_list = [g.get("name") for g in game_data.get("genres", []) if g.get("name")]
-                themes_list = [t.get("name") for t in game_data.get("themes", []) if t.get("name")]
-                keywords_list = [k.get("name") for k in game_data.get("keywords", []) if k.get("name")]
-                modes_list = [m.get("name") for m in game_data.get("game_modes", []) if m.get("name")]
-
-                # Extract release date
-                release_date = game_data.get("first_release_date")
-                release_year = None
-                if release_date:
-                    import datetime
-                    release_year = datetime.datetime.fromtimestamp(release_date).year
-
-                return IGDBGame(
-                    id=game_data["id"],
-                    name=game_data["name"],
-                    slug=game_data.get("slug", ""),
-                    cover_url=cover_url,
-                    platforms=platforms_list,
-                    summary=game_data.get("summary"),
-                    release_year=release_year,
-                    release_date=release_date,
-                    genres=genres_list,
-                    themes=themes_list,
-                    keywords=keywords_list,
-                    game_modes=modes_list,
-                    rating=game_data.get("rating"),
-                    hypes=game_data.get("hypes"),
-                )
+        return IGDBGame(
+            id=game_data["id"],
+            name=game_data["name"],
+            slug=game_data.get("slug", ""),
+            cover_url=cover_url,
+            platforms=platforms_list,
+            summary=game_data.get("summary"),
+            release_year=release_year,
+            release_date=release_date,
+            genres=genres_list,
+            themes=themes_list,
+            keywords=keywords_list,
+            game_modes=modes_list,
+            rating=game_data.get("rating"),
+            hypes=game_data.get("hypes"),
+        )
 
     except Exception as e:
         logger.error(f"Error getting full game details from IGDB: {e}")
@@ -371,10 +341,6 @@ async def get_release_dates_bulk(game_ids: List[int]) -> Dict[int, Optional[int]
     if not game_ids:
         return {}
 
-    token = await get_twitch_token()
-    if not token:
-        return {}
-
     results = {}
 
     # IGDB allows querying multiple IDs in one request (up to 500)
@@ -383,39 +349,22 @@ async def get_release_dates_bulk(game_ids: List[int]) -> Dict[int, Optional[int]
     for i in range(0, len(game_ids), batch_size):
         batch = game_ids[i:i + batch_size]
 
-        await _rate_limit()  # Enforce rate limiting
+        ids_str = ",".join(str(gid) for gid in batch)
+        body = f'''
+            fields id, first_release_date;
+            where id = ({ids_str});
+            limit {len(batch)};
+        '''
 
         try:
-            async with aiohttp.ClientSession() as session:
-                headers = {
-                    "Client-ID": TWITCH_CLIENT_ID,
-                    "Authorization": f"Bearer {token}",
-                    "Accept": "application/json"
-                }
-
-                # Query multiple IDs at once
-                ids_str = ",".join(str(gid) for gid in batch)
-                body = f'''
-                    fields id, first_release_date;
-                    where id = ({ids_str});
-                    limit {len(batch)};
-                '''
-
-                async with session.post(
-                    f"{IGDB_API_URL}/games",
-                    headers=headers,
-                    data=body
-                ) as response:
-                    if response.status != 200:
-                        logger.error(f"IGDB API returned {response.status} for release date bulk fetch")
-                        continue
-
-                    data = await response.json()
-                    for game_data in data:
-                        game_id = game_data.get("id")
-                        release_date = game_data.get("first_release_date")
-                        if game_id:
-                            results[game_id] = release_date
+            data = await _igdb_post("games", body)
+            if data is None:
+                continue
+            for game_data in data:
+                game_id = game_data.get("id")
+                release_date = game_data.get("first_release_date")
+                if game_id:
+                    results[game_id] = release_date
 
         except Exception as e:
             logger.error(f"Error fetching release dates from IGDB: {e}")
@@ -426,71 +375,50 @@ async def get_release_dates_bulk(game_ids: List[int]) -> Dict[int, Optional[int]
 
 async def get_popular_games(limit: int = 25) -> List[IGDBGame]:
     """Get currently popular games for suggestions."""
-    token = await get_twitch_token()
-    if not token:
-        return []
-
-    await _rate_limit()  # Enforce rate limiting
+    body = f'''
+        fields name, slug, cover.image_id, platforms.abbreviation, summary, first_release_date, follows;
+        where category = 0 & follows > 10;
+        sort follows desc;
+        limit {limit};
+    '''
 
     try:
-        async with aiohttp.ClientSession() as session:
-            headers = {
-                "Client-ID": TWITCH_CLIENT_ID,
-                "Authorization": f"Bearer {token}",
-                "Accept": "application/json"
-            }
+        data = await _igdb_post("games", body)
+        if data is None:
+            return []
+        games = []
 
-            # Get games with high hype/follows, released in last 2 years
-            body = f'''
-                fields name, slug, cover.image_id, platforms.abbreviation, summary, first_release_date, follows;
-                where category = 0 & follows > 10;
-                sort follows desc;
-                limit {limit};
-            '''
+        for game_data in data:
+            cover_url = None
+            if "cover" in game_data and game_data["cover"]:
+                image_id = game_data["cover"].get("image_id")
+                if image_id:
+                    cover_url = f"https://images.igdb.com/igdb/image/upload/t_cover_big/{image_id}.jpg"
 
-            async with session.post(
-                f"{IGDB_API_URL}/games",
-                headers=headers,
-                data=body
-            ) as response:
-                if response.status != 200:
-                    return []
+            platforms = []
+            if "platforms" in game_data:
+                for platform in game_data["platforms"]:
+                    abbr = platform.get("abbreviation")
+                    if abbr:
+                        platforms.append(abbr)
 
-                data = await response.json()
-                games = []
+            release_year = None
+            if "first_release_date" in game_data:
+                import datetime
+                ts = game_data["first_release_date"]
+                release_year = datetime.datetime.fromtimestamp(ts).year
 
-                for game_data in data:
-                    cover_url = None
-                    if "cover" in game_data and game_data["cover"]:
-                        image_id = game_data["cover"].get("image_id")
-                        if image_id:
-                            cover_url = f"https://images.igdb.com/igdb/image/upload/t_cover_big/{image_id}.jpg"
+            games.append(IGDBGame(
+                id=game_data["id"],
+                name=game_data["name"],
+                slug=game_data.get("slug", ""),
+                cover_url=cover_url,
+                platforms=platforms,
+                summary=game_data.get("summary"),
+                release_year=release_year
+            ))
 
-                    platforms = []
-                    if "platforms" in game_data:
-                        for platform in game_data["platforms"]:
-                            abbr = platform.get("abbreviation")
-                            if abbr:
-                                platforms.append(abbr)
-
-                    release_year = None
-                    if "first_release_date" in game_data:
-                        import datetime
-                        ts = game_data["first_release_date"]
-                        release_year = datetime.datetime.fromtimestamp(ts).year
-
-                    game = IGDBGame(
-                        id=game_data["id"],
-                        name=game_data["name"],
-                        slug=game_data.get("slug", ""),
-                        cover_url=cover_url,
-                        platforms=platforms,
-                        summary=game_data.get("summary"),
-                        release_year=release_year
-                    )
-                    games.append(game)
-
-                return games
+        return games
 
     except Exception as e:
         logger.error(f"Error getting popular games: {e}")
@@ -509,54 +437,32 @@ async def get_all_keywords(max_results: int = 10000) -> List[Dict[str, Any]]:
     Returns:
         List of keyword dicts with 'id', 'name', 'slug'
     """
-    token = await get_twitch_token()
-    if not token:
-        return []
-
     all_keywords = []
     offset = 0
     batch_size = 500  # IGDB max per request
 
     try:
-        async with aiohttp.ClientSession() as session:
-            headers = {
-                "Client-ID": TWITCH_CLIENT_ID,
-                "Authorization": f"Bearer {token}",
-                "Accept": "application/json"
-            }
+        while len(all_keywords) < max_results:
+            body = f'''
+                fields id, name, slug;
+                sort name asc;
+                limit {batch_size};
+                offset {offset};
+            '''
 
-            while len(all_keywords) < max_results:
-                await _rate_limit()
+            batch = await _igdb_post("keywords", body)
+            if not batch:
+                break  # No more results or error
 
-                body = f'''
-                    fields id, name, slug;
-                    sort name asc;
-                    limit {batch_size};
-                    offset {offset};
-                '''
+            all_keywords.extend(batch)
+            offset += batch_size
 
-                async with session.post(
-                    f"{IGDB_API_URL}/keywords",
-                    headers=headers,
-                    data=body
-                ) as response:
-                    if response.status != 200:
-                        logger.error(f"IGDB fetch keywords failed: {response.status}")
-                        break
+            logger.info(f"Fetched {len(all_keywords)} keywords so far...")
 
-                    batch = await response.json()
-                    if not batch:
-                        break  # No more results
+            if len(batch) < batch_size:
+                break  # Last page
 
-                    all_keywords.extend(batch)
-                    offset += batch_size
-
-                    logger.info(f"Fetched {len(all_keywords)} keywords so far...")
-
-                    if len(batch) < batch_size:
-                        break  # Last page
-
-            return all_keywords[:max_results]
+        return all_keywords[:max_results]
 
     except Exception as e:
         logger.error(f"Error fetching keywords: {e}", exc_info=True)
@@ -579,51 +485,29 @@ async def get_keyword_ids(keyword_names: List[str]) -> List[int]:
     if not keyword_names:
         return []
 
-    token = await get_twitch_token()
-    if not token:
-        return []
+    # Build OR query for all keyword names (case-insensitive)
+    name_conditions = " | ".join([f'name ~ *"{name}"*' for name in keyword_names])
+    body = f'''
+        fields id, name;
+        where {name_conditions};
+        limit 100;
+    '''
 
-    await _rate_limit()
+    logger.info(f"Looking up keyword IDs for: {keyword_names}")
 
     try:
-        async with aiohttp.ClientSession() as session:
-            headers = {
-                "Client-ID": TWITCH_CLIENT_ID,
-                "Authorization": f"Bearer {token}",
-                "Accept": "application/json"
-            }
+        data = await _igdb_post("keywords", body)
+        if data is None:
+            return []
 
-            # Build OR query for all keyword names (case-insensitive)
-            name_conditions = " | ".join([f'name ~ *"{name}"*' for name in keyword_names])
-            body = f'''
-                fields id, name;
-                where {name_conditions};
-                limit 100;
-            '''
+        # Return all matching keyword IDs from IGDB's fuzzy search
+        # IGDB already does the fuzzy matching, so we trust its results
+        ids = []
+        for kw in data:
+            ids.append(kw["id"])
+            logger.info(f"Found keyword '{kw['name']}' (ID: {kw['id']})")
 
-            logger.info(f"Looking up keyword IDs for: {keyword_names}")
-
-            async with session.post(
-                f"{IGDB_API_URL}/keywords",
-                headers=headers,
-                data=body
-            ) as response:
-                if response.status != 200:
-                    logger.error(f"IGDB keyword lookup failed: {response.status}")
-                    text = await response.text()
-                    logger.error(f"Response: {text}")
-                    return []
-
-                data = await response.json()
-
-                # Return all matching keyword IDs from IGDB's fuzzy search
-                # IGDB already does the fuzzy matching, so we trust its results
-                ids = []
-                for kw in data:
-                    ids.append(kw["id"])
-                    logger.info(f"Found keyword '{kw['name']}' (ID: {kw['id']})")
-
-                return ids
+        return ids
 
     except Exception as e:
         logger.error(f"Error looking up keyword IDs: {e}", exc_info=True)
@@ -669,12 +553,6 @@ async def search_upcoming_games(
         - Coming soon (next 7 days): days_ahead=7, days_behind=0
         - Last week to next week: days_ahead=7, days_behind=7
     """
-    token = await get_twitch_token()
-    if not token:
-        return []
-
-    await _rate_limit()
-
     try:
         # Calculate timestamp range
         now = int(time.time())
@@ -861,165 +739,101 @@ async def search_upcoming_games(
 
         where_clause = " & ".join(required_clauses)
 
-        async with aiohttp.ClientSession() as session:
-            headers = {
-                "Client-ID": TWITCH_CLIENT_ID,
-                "Authorization": f"Bearer {token}",
-                "Accept": "application/json"
-            }
+        # Request comprehensive game data including genres, themes, keywords, modes, ratings, hypes, media
+        body = f'''
+            fields name, slug, cover.image_id, platforms.name, summary,
+                   first_release_date, genres.name, themes.name, keywords.name, game_modes.name, url,
+                   rating, hypes,
+                   screenshots.image_id, videos.name, videos.video_id,
+                   websites.category, websites.url;
+            where {where_clause};
+            sort first_release_date asc;
+            limit {limit};
+        '''
 
-            # Request comprehensive game data including genres, themes, keywords, modes, ratings, hypes, media
-            body = f'''
-                fields name, slug, cover.image_id, platforms.name, summary,
-                       first_release_date, genres.name, themes.name, keywords.name, game_modes.name, url,
-                       rating, hypes,
-                       screenshots.image_id, videos.name, videos.video_id,
-                       websites.category, websites.url;
-                where {where_clause};
-                sort first_release_date asc;
-                limit {limit};
-            '''
+        logger.info(f"IGDB Query: {body.strip()}")
 
-            # Log the query for debugging
-            logger.info(f"IGDB Query: {body.strip()}")
+        data = await _igdb_post("games", body)
+        if data is None:
+            return []
 
-            async with session.post(
-                f"{IGDB_API_URL}/games",
-                headers=headers,
-                data=body
-            ) as response:
-                if response.status != 200:
-                    logger.error(f"IGDB upcoming games search failed: {response.status}")
-                    text = await response.text()
-                    logger.error(f"Response: {text}")
-                    return []
+        games = []
 
-                data = await response.json()
-                games = []
+        for game_data in data:
+            cover_url = None
+            if "cover" in game_data and game_data["cover"]:
+                image_id = game_data["cover"].get("image_id")
+                if image_id:
+                    cover_url = f"https://images.igdb.com/igdb/image/upload/t_cover_big/{image_id}.jpg"
 
-                for game_data in data:
-                    # Build cover URL
-                    cover_url = None
-                    if "cover" in game_data and game_data["cover"]:
-                        image_id = game_data["cover"].get("image_id")
-                        if image_id:
-                            cover_url = f"https://images.igdb.com/igdb/image/upload/t_cover_big/{image_id}.jpg"
+            platforms_list = [p.get("name") for p in game_data.get("platforms", []) if p.get("name")]
+            genres_list = [g.get("name") for g in game_data.get("genres", []) if g.get("name")]
+            themes_list = [t.get("name") for t in game_data.get("themes", []) if t.get("name")]
+            modes_list = [m.get("name") for m in game_data.get("game_modes", []) if m.get("name")]
+            keywords_list = [k.get("name") for k in game_data.get("keywords", []) if k.get("name")]
 
-                    # Extract platform names
-                    platforms_list = []
-                    if "platforms" in game_data:
-                        for platform in game_data["platforms"]:
-                            name = platform.get("name")
-                            if name:
-                                platforms_list.append(name)
+            release_date = game_data.get("first_release_date")
+            release_year = None
+            if release_date:
+                import datetime
+                release_year = datetime.datetime.fromtimestamp(release_date).year
 
-                    # Extract genres
-                    genres_list = []
-                    if "genres" in game_data:
-                        for genre in game_data["genres"]:
-                            name = genre.get("name")
-                            if name:
-                                genres_list.append(name)
+            rating = game_data.get("rating")
+            hypes = game_data.get("hypes")
 
-                    # Extract themes
-                    themes_list = []
-                    if "themes" in game_data:
-                        for theme in game_data["themes"]:
-                            name = theme.get("name")
-                            if name:
-                                themes_list.append(name)
+            screenshots_list = []
+            for screenshot in game_data.get("screenshots", [])[:4]:
+                image_id = screenshot.get("image_id")
+                if image_id:
+                    screenshots_list.append(f"https://images.igdb.com/igdb/image/upload/t_screenshot_big/{image_id}.jpg")
 
-                    # Extract game modes
-                    modes_list = []
-                    if "game_modes" in game_data:
-                        for mode in game_data["game_modes"]:
-                            name = mode.get("name")
-                            if name:
-                                modes_list.append(name)
+            videos_list = []
+            for video in game_data.get("videos", [])[:2]:
+                video_id = video.get("video_id")
+                if video_id:
+                    videos_list.append({"name": video.get("name", "Trailer"), "video_id": video_id})
 
-                    # Extract keywords (Souls-like, Metroidvania, etc.)
-                    keywords_list = []
-                    if "keywords" in game_data:
-                        for keyword in game_data["keywords"]:
-                            name = keyword.get("name")
-                            if name:
-                                keywords_list.append(name)
+            websites_list = []
+            # Website categories: 1=official, 13=steam, 16=epicgames, 17=gog, 18=discord
+            for website in game_data.get("websites", []):
+                category = website.get("category")
+                url = website.get("url")
+                if url:
+                    if not category:
+                        if 'store.steampowered.com' in url:
+                            category = 13
+                        elif 'store.epicgames.com' in url or 'epicgames.com' in url:
+                            category = 16
+                        elif 'gog.com' in url:
+                            category = 17
+                        elif 'discord.gg' in url or 'discord.com' in url:
+                            category = 18
+                    websites_list.append({"category": category, "url": url})
 
-                    # Extract release date
-                    release_date = game_data.get("first_release_date")
-                    release_year = None
-                    if release_date:
-                        import datetime
-                        release_year = datetime.datetime.fromtimestamp(release_date).year
+            game = IGDBGame(
+                id=game_data["id"],
+                name=game_data["name"],
+                slug=game_data.get("slug", ""),
+                cover_url=cover_url,
+                platforms=platforms_list,
+                summary=game_data.get("summary"),
+                release_year=release_year,
+                release_date=release_date,
+                genres=genres_list,
+                themes=themes_list,
+                game_modes=modes_list,
+                keywords=keywords_list,
+                igdb_url=game_data.get("url"),
+                rating=rating,
+                hypes=hypes,
+                screenshots=screenshots_list,
+                videos=videos_list,
+                websites=websites_list
+            )
+            games.append(game)
 
-                    # Extract rating and hypes (pre-release follows)
-                    rating = game_data.get("rating")
-                    hypes = game_data.get("hypes")
-
-                    # Extract screenshots
-                    screenshots_list = []
-                    if "screenshots" in game_data:
-                        for screenshot in game_data["screenshots"][:4]:  # Limit to 4 screenshots
-                            image_id = screenshot.get("image_id")
-                            if image_id:
-                                # Use 1080p screenshots
-                                screenshots_list.append(f"https://images.igdb.com/igdb/image/upload/t_screenshot_big/{image_id}.jpg")
-
-                    # Extract videos
-                    videos_list = []
-                    if "videos" in game_data:
-                        for video in game_data["videos"][:2]:  # Limit to 2 videos
-                            video_id = video.get("video_id")
-                            name = video.get("name", "Trailer")
-                            if video_id:
-                                videos_list.append({"name": name, "video_id": video_id})
-
-                    # Extract websites
-                    websites_list = []
-                    if "websites" in game_data:
-                        # Website categories: 1=official, 2=wikia, 3=wikipedia, 4=facebook, 5=twitter,
-                        # 6=twitch, 8=instagram, 9=youtube, 10=iphone, 11=ipad, 12=android,
-                        # 13=steam, 14=reddit, 15=itch, 16=epicgames, 17=gog, 18=discord
-                        for website in game_data["websites"]:
-                            category = website.get("category")
-                            url = website.get("url")
-                            if url:
-                                # If category not provided by API, infer from URL
-                                if not category:
-                                    if 'store.steampowered.com' in url:
-                                        category = 13
-                                    elif 'store.epicgames.com' in url or 'epicgames.com' in url:
-                                        category = 16
-                                    elif 'gog.com' in url:
-                                        category = 17
-                                    elif 'discord.gg' in url or 'discord.com' in url:
-                                        category = 18
-                                websites_list.append({"category": category, "url": url})
-
-                    game = IGDBGame(
-                        id=game_data["id"],
-                        name=game_data["name"],
-                        slug=game_data.get("slug", ""),
-                        cover_url=cover_url,
-                        platforms=platforms_list,
-                        summary=game_data.get("summary"),
-                        release_year=release_year,
-                        release_date=release_date,
-                        genres=genres_list,
-                        themes=themes_list,
-                        game_modes=modes_list,
-                        keywords=keywords_list,
-                        igdb_url=game_data.get("url"),
-                        rating=rating,
-                        hypes=hypes,
-                        screenshots=screenshots_list,
-                        videos=videos_list,
-                        websites=websites_list
-                    )
-                    games.append(game)
-
-                logger.info(f"Found {len(games)} upcoming games matching filters")
-                return games
+        logger.info(f"Found {len(games)} upcoming games matching filters")
+        return games
 
     except Exception as e:
         logger.error(f"Error searching upcoming games: {e}", exc_info=True)

@@ -19,6 +19,11 @@ if _secrets_path.exists():
 else:
     load_dotenv(override=True)
 
+# Load game server secrets (7DTD RCON, event secrets, AMP log paths)
+_game_secrets_path = Path("/etc/casual-heroes/secrets.env")
+if _game_secrets_path.exists():
+    load_dotenv(_game_secrets_path, override=True)
+
 # ====== Logging ======
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
@@ -51,8 +56,9 @@ COMMAND_PREFIX = os.getenv("COMMAND_PREFIX", "!")
 IS_PRODUCTION = os.getenv("ENVIRONMENT", "development").lower() == "production"
 
 # QuestLog web platform internal API (for bot <-> web comms)
-QUESTLOG_INTERNAL_API_URL = os.getenv("QUESTLOG_INTERNAL_API_URL", "https://casual-heroes.com/ql")
+QUESTLOG_INTERNAL_API_URL = os.getenv("QUESTLOG_INTERNAL_API_URL", "https://casual-heroes.com")
 QUESTLOG_BOT_SECRET = os.getenv("QUESTLOG_BOT_SECRET", "")
+DISCORD_BOT_TOKEN = os.getenv("WARDEN_BOT_TOKEN", "")
 
 # IGDB (uses Twitch OAuth) - same creds as wardenbot
 IGDB_CLIENT_ID = os.getenv("TWITCH_CLIENT_ID") or os.getenv("IGDB_CLIENT_ID", "")
