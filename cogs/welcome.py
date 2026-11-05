@@ -19,11 +19,38 @@
 import time
 import json
 
+import aiohttp
 import fluxer
 from fluxer import Cog
 from fluxer.models.user import User
 from sqlalchemy import text
-from config import logger, db_session_scope
+from config import logger, db_session_scope, DISCORD_BOT_TOKEN
+
+# TEMP - remove when off Discord
+_DISCORD_GENERAL_CHANNEL_ID = "1327335088261824584"
+_FLUXER_NOTIFY_GUILD_ID = "1474761008438513445"
+_FLUXER_INVITE_URL = "https://fluxer.gg/zplS0MwI"
+
+
+async def _notify_discord_join(guild_id, username):
+    """The temporary migration notice belongs only to Casual Heroes."""
+    if str(guild_id) != _FLUXER_NOTIFY_GUILD_ID or not DISCORD_BOT_TOKEN:
+        return
+    username = str(username).replace('\r', ' ').replace('\n', ' ')[:80]
+    msg = (
+        f":partying_face: **{username}** just joined us on Fluxer! "
+        f"Our community is growing beyond Discord - come join them: {_FLUXER_INVITE_URL}"
+    )
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            f"https://discord.com/api/v10/channels/{_DISCORD_GENERAL_CHANNEL_ID}/messages",
+            json={"content": msg, "allowed_mentions": {"parse": []}},
+            headers={"Authorization": f"Bot {DISCORD_BOT_TOKEN}", "Content-Type": "application/json"},
+            timeout=aiohttp.ClientTimeout(total=5),
+            allow_redirects=False,
+        ) as response:
+            if response.status not in (200, 201):
+                logger.warning("WelcomeCog: Discord cross-notify rejected: HTTP %s", response.status)
 
 
 def _ordinal(n: int) -> str:
@@ -301,6 +328,13 @@ class WelcomeCog(Cog):
                             f"WelcomeCog: [ROLE PERSIST] restored {restored} roles "
                             f"for {user_id} rejoining {guild_id}"
                         )
+
+            # TEMP - notify Discord that a new Fluxer member joined, remove when off Discord
+            try:
+                await _notify_discord_join(guild_id, username)
+            except Exception as e:
+                logger.warning(f"WelcomeCog: Discord cross-notify failed: {e}")
+            # END TEMP
 
             logger.info(f"WelcomeCog: welcomed {username} ({user_id}) in guild {guild_id}")
 

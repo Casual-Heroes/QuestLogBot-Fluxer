@@ -26,6 +26,13 @@ logs/
 *.db
 *.sqlite3
 
+# Generated activity and game-server state; keep live files out of source control.
+/data/fluxer_activity_data.json
+/data/sdtd/active_bosses.json
+/data/sdtd/online_players.json
+/data/sdtd/player_positions.json
+/data/soulmask/schedule.json
+
 # IDE
 .idea/
 .vscode/

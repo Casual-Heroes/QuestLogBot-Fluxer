@@ -950,5 +950,75 @@ class XpCog(Cog):
         await ctx.reply(embed=embed)
 
 
+    @Cog.command(name='nudge_unlinked')
+    async def cmd_nudge_unlinked(self, ctx):
+        """!nudge_unlinked (admin) - DM Fluxer members with XP who haven't linked QuestLog."""
+        from cogs.permissions import is_administrator
+        if not await is_administrator(ctx):
+            return
+
+        guild_id = str(ctx.guild.id)
+        connect_url = "https://questlog.casual-heroes.com/settings/"
+        register_url = "https://questlog.casual-heroes.com/register/"
+
+        try:
+            with db_session_scope() as db:
+                # Members with XP in this guild
+                members_with_xp = db.execute(
+                    text("SELECT user_id, username, SUM(xp) as total FROM fluxer_member_xp "
+                         "WHERE guild_id = :g GROUP BY user_id, username HAVING total > 0 ORDER BY total DESC"),
+                    {'g': guild_id}
+                ).fetchall()
+
+                # Already linked fluxer IDs
+                linked_ids = {
+                    str(r[0]) for r in db.execute(
+                        text("SELECT fluxer_id FROM web_users WHERE fluxer_id IS NOT NULL")
+                    ).fetchall()
+                }
+        except Exception as e:
+            logger.error(f"cmd_nudge_unlinked DB error: {e}")
+            await self.bot._http.send_message(str(ctx.channel.id), content="Failed to load member data.")
+            return
+
+        unlinked = [m for m in members_with_xp if str(m[0]) not in linked_ids]
+
+        if not unlinked:
+            await self.bot._http.send_message(str(ctx.channel.id),
+                content="All members with XP already have linked QuestLog accounts!")
+            return
+
+        sent = failed = 0
+        for m in unlinked:
+            try:
+                embed = {
+                    'title': 'Connect Your QuestLog Account',
+                    'description': (
+                        f"Hey **{m[1]}**! You've earned **{int(m[2]):,} XP** on Fluxer.\n\n"
+                        "Link your QuestLog account to unify your XP across Fluxer, Discord, "
+                        "and the website - one leaderboard for everything.\n\n"
+                        f"**Already have an account?** Connect at:\n{connect_url}\n\n"
+                        f"**New to QuestLog?** Join free at:\n{register_url}"
+                    ),
+                    'color': 0x6366F1,
+                    'footer': {'text': 'Casual Heroes · questlog.casual-heroes.com'},
+                }
+                dm = await self.bot.create_dm(str(m[0]))
+                if dm:
+                    await self.bot._http.send_message(str(dm['id']), embeds=[embed])
+                    sent += 1
+                    import asyncio
+                    await asyncio.sleep(1)
+            except Exception as e:
+                logger.debug(f"cmd_nudge_unlinked: DM failed for {m[1]}: {e}")
+                failed += 1
+
+        await self.bot._http.send_message(
+            str(ctx.channel.id),
+            content=f"Nudge complete - **{sent}** DMs sent, **{failed}** failed.\n"
+                    f"**{len(unlinked)}** Fluxer members have XP but no linked QuestLog account."
+        )
+
+
 def setup(bot):
     bot.add_cog(XpCog(bot))

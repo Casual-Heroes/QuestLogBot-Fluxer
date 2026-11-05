@@ -6,6 +6,7 @@
 # Architecture:
 #   - On ready: polls AMP for all instances, reads GenericModule.kvp for
 #     log regexes, inserts unknown instances into gamebot_configs as unconfigured
+#   - Quest Control is the authenticated AMP boundary for status and lifecycle actions
 #   - Per configured instance: starts a LogWatcher, status monitor, daily scheduler
 #   - Commands are generic: !gs_status, !gs_start, !gs_stop, !gs_restart,
 #     !gs_players, !gs_backup -- work for ANY game
@@ -23,11 +24,17 @@ import time
 from glob import glob
 from pathlib import Path
 
+import aiohttp
 import fluxer
 from fluxer import Cog
-from sqlalchemy import text
+from sqlalchemy import text, bindparam
 
-from config import logger, db_session_scope
+from config import (
+    QUEST_CONTROL_BOT_SECRET,
+    QUESTLOG_INTERNAL_API_URL,
+    db_session_scope,
+    logger,
+)
 
 # Suppress noisy AMP library connection error logs - we handle them gracefully
 logging.getLogger('ampapi').setLevel(logging.CRITICAL)
@@ -36,6 +43,7 @@ logging.getLogger('ampapi').setLevel(logging.CRITICAL)
 AMP_URL      = os.getenv('AMP_URL', '')
 AMP_USER     = os.getenv('AMP_USER', '')
 AMP_PASSWORD = os.getenv('AMP_PASSWORD', '')
+AMP_SERVER_PASSWORD_NODE = 'Meta.GenericModule.ServerPassword'
 
 # ---- AMP instance base paths (local + remote NFS mounts) ----
 # Primary local path. Additional paths can be added via AMP_INSTANCES_EXTRA
@@ -45,6 +53,17 @@ _extra_raw = os.getenv('AMP_INSTANCES_EXTRA', '')
 AMP_INSTANCES_PATHS: list[Path] = [AMP_INSTANCES_BASE] + [
     Path(p.strip()) for p in _extra_raw.split(':') if p.strip()
 ]
+# A narrowly scoped compatibility mapping for the one AMP instance hosted on
+# the first game-storage volume. Do not add the whole volume as a search root.
+EXPLICIT_INSTANCE_ROOTS = {
+    'ShroudQuest01': Path('/mnt/gamestoreage1/ShroudQuest01'),
+}
+# Server B stores AMP instances beneath ampdata rather than gamestorage. Keep
+# this compatibility root in code so a stale environment list cannot make a
+# real remote backup look missing after AMP has successfully created it.
+_SERVER_B_AMP_ROOT = Path('/mnt/remote/serverb/ampdata/instances')
+if _SERVER_B_AMP_ROOT.exists() and _SERVER_B_AMP_ROOT not in AMP_INSTANCES_PATHS:
+    AMP_INSTANCES_PATHS.append(_SERVER_B_AMP_ROOT)
 
 # ---- 7DTD-specific RCON (preserved from sdtd.py) ----
 RCON_HOST     = os.getenv('RCON_HOST', '')
@@ -86,11 +105,15 @@ SDTD_SPAWN_RADIUS = 15
 # ---------------------------------------------------------------------------
 
 class LogWatcher:
-    """Tails the latest AMPLOG *.log file in the given directory."""
+    """Tails the latest AMPLOG_*.log file in the given directory."""
 
     def __init__(self, log_dir: str):
         self.log_dir = log_dir
-        self.glob_pattern = os.path.join(log_dir, 'AMPLOG *.log')
+        # Real filenames are "AMPLOG_2026-07-12 22-42-00.log" - underscore after
+        # AMPLOG, space before the time. A stray space-instead-of-underscore here
+        # silently matched zero files, so no join/leave events were ever processed
+        # for ANY instance - "Currently Online"/"Top Players" always showed empty.
+        self.glob_pattern = os.path.join(log_dir, 'AMPLOG_*.log')
         self.current_file: str | None = None
         self.file_handle = None
         self.file_position: int = 0
@@ -155,63 +178,192 @@ def _filter_live_log_lines(lines: list[str]) -> list[str]:
     return out
 
 
+def _chunk_log_lines(lines: list[str], max_chars: int = 1900) -> list[str]:
+    """Batch filtered log lines into chunks under Discord/Fluxer's message length
+    limit. Shared by both platforms' live-log sends so a given batch of lines is
+    grouped identically regardless of which channel(s) it's forwarded to."""
+    chunks = []
+    chunk = ''
+    for line in lines:
+        if len(chunk) + len(line) + 1 > max_chars:
+            chunks.append(chunk)
+            chunk = ''
+        chunk += line + '\n'
+    if chunk:
+        chunks.append(chunk)
+    return chunks
+
+
 def _fix_regex(pattern: str) -> str:
     """Convert .NET/PCRE named groups (?<name>...) to Python syntax (?P<name>...).
-    Duplicate named groups in | alternation become unnamed groups since Python
-    re does not allow redefinition of a group name.
+    Duplicate named groups in alternatives receive numbered suffixes because
+    Python does not allow a group name to be defined more than once.
     """
     import re as _re
     converted = _re.sub(r'\(\?<([^>]+)>', r'(?P<\1>', pattern)
-    seen: set = set()
+    seen: dict[str, int] = {}
+
     def _dedup(m):
         name = m.group(1)
-        if name in seen:
-            return '(?:'
-        seen.add(name)
-        return m.group(0)
+        seen[name] = seen.get(name, 0) + 1
+        if seen[name] == 1:
+            return m.group(0)
+        return f'(?P<{name}_{seen[name]}>'
+
     return _re.sub(r'\(\?P<([^>]+)>', _dedup, converted)
 
 
+def _capture(match: re.Match, name: str) -> str:
+    """Return a named capture, including a renamed alternative capture."""
+    groups = match.groupdict()
+    value = groups.get(name)
+    if value:
+        return str(value).strip()
+    for key, candidate in groups.items():
+        if key.startswith(f'{name}_') and candidate:
+            return str(candidate).strip()
+    return ''
+
+
+def _normalize_player_id(value: str | None) -> str | None:
+    """Return the stable account ID portion emitted by game-server logs.
+
+    Newer Palworld builds append a separate player ID to the account ID. The
+    combined value is not the user ID and exceeds gamebot_players.userid.
+    """
+    if not value:
+        return None
+    normalized = re.split(
+        r',\s*(?:Player\s+id|IP)\s*[:=]',
+        str(value).strip(),
+        maxsplit=1,
+        flags=re.IGNORECASE,
+    )[0].strip()
+    return normalized[:64] or None
+
+
+def _default_log_regexes(game_type: str) -> tuple[str | None, str | None]:
+    """Return parsers only for AMP modules that do not publish log regexes."""
+    normalized = (game_type or '').lower()
+    if 'minecraft' in normalized:
+        return (
+            r'^\[[^\]]+\] \[[^\]]+/INFO\]: '
+            r'(?P<username>[A-Za-z0-9_]{1,16})\[[^\]]+\]: '
+            r'logged in with entity id\b',
+            r'^\[[^\]]+\] \[[^\]]+/INFO\]: '
+            r'(?P<username>[A-Za-z0-9_]{1,16}) lost connection:',
+        )
+    if 'palworld' in normalized:
+        return (
+            r'^(?:\[[\d-]+ [\d:]+\] \[LOG\] )?'
+            r'(?P<username>.+) joined the server\. '
+            r'\(User id: (?P<userid>[^,)]+)'
+            r'(?:, Player id: [^)]+)?\)|'
+            r"(?:\[[\d:]+\]\s?\[info\] )?'(?P<username_2>.+)' "
+            r'\(UserId=(?P<userid_2>[^,)]+)'
+            r'(, IP=(?P<endpoint>.+?))?\) has logged in\.$',
+            r'^(?:\[[\d-]+ [\d:]+\] \[LOG\] )?'
+            r'(?P<username>.+) left the server\. '
+            r'\(User id: (?P<userid>[^,)]+)'
+            r'(?:, Player id: [^)]+)?\)|'
+            r"(?:\[[\d:]+\]\s?\[info\] )?'(?P<username_2>.+)' "
+            r'\(UserId=(?P<userid_2>[^,)]+)'
+            r'(, IP=(?P<endpoint>.+?))?\) has logged out\.$',
+        )
+    return None, None
+
+
 def read_kvp(instance_name: str) -> dict:
-    """Read GenericModule.kvp for an AMP instance. Returns dict of key->value.
-    Also parses App.AppSettings JSON and sets 'server_password' from the
-    game-specific password field (Password / ServerPassword)."""
-    instance_base = next(
+    """Read AMP module KVP data for an instance.
+
+    GenericModule is preferred when present, but module-specific files such as
+    MinecraftModule are also scanned so this works for every AMP module.
+    """
+    explicit_root = EXPLICIT_INSTANCE_ROOTS.get(instance_name)
+    instance_base = explicit_root if explicit_root and explicit_root.exists() else next(
         (p / instance_name for p in AMP_INSTANCES_PATHS if (p / instance_name).exists()),
         AMP_INSTANCES_BASE / instance_name
     )
-    kvp_path = instance_base / 'GenericModule.kvp'
     result = {}
     try:
-        if not kvp_path.exists():
+        generic_path = instance_base / 'GenericModule.kvp'
+        module_paths = sorted(instance_base.glob('*Module.kvp'))
+        kvp_paths = (
+            ([generic_path] if generic_path in module_paths else [])
+            + [path for path in module_paths if path != generic_path]
+        )
+        if not kvp_paths:
             return result
     except PermissionError:
-        logger.warning(f'read_kvp: permission denied on {kvp_path} - fix with: sudo chmod o+rx {kvp_path.parent}')
+        logger.warning(
+            f'read_kvp: permission denied on {instance_base}'
+        )
         return result
-    try:
-        text = kvp_path.read_text(errors='replace')
-    except PermissionError:
-        logger.warning(f'read_kvp: permission denied reading {kvp_path}')
-        return result
-    for line in text.splitlines():
-        if '=' in line:
-            k, _, v = line.partition('=')
-            k = k.strip()
-            v = v.strip()
-            # Translate .NET named group syntax to Python for regex fields
-            if k in ('Console.UserJoinRegex', 'Console.UserLeaveRegex'):
-                v = _fix_regex(v)
-            result[k] = v
+
+    for kvp_path in kvp_paths:
+        try:
+            kvp_text = kvp_path.read_text(errors='replace')
+        except PermissionError:
+            logger.warning(f'read_kvp: permission denied reading {kvp_path}')
+            continue
+        for line in kvp_text.splitlines():
+            if '=' not in line:
+                continue
+            key, _, value = line.partition('=')
+            key = key.strip()
+            value = value.strip()
+            if key in ('Console.UserJoinRegex', 'Console.UserLeaveRegex'):
+                value = _fix_regex(value)
+            # GenericModule was loaded first and remains authoritative. Other
+            # module files fill only fields GenericModule did not publish.
+            result.setdefault(key, value)
     # Extract server password from App.AppSettings JSON
     app_settings_raw = result.get('App.AppSettings', '')
     if app_settings_raw:
         try:
             app_settings = json.loads(app_settings_raw)
-            # Different games use different key names
-            pw = app_settings.get('Password') or app_settings.get('ServerPassword') or ''
-            result['server_password'] = pw.strip()
+            # Different games use different key names. Only publish the key
+            # when the source actually contains it: missing and explicitly
+            # empty have different meanings during the discovery upsert.
+            if 'Password' in app_settings:
+                pw = app_settings.get('Password')
+                result['server_password'] = str(pw or '').strip()
+            elif 'ServerPassword' in app_settings:
+                pw = app_settings.get('ServerPassword')
+                result['server_password'] = str(pw or '').strip()
         except (json.JSONDecodeError, AttributeError):
             pass
+
+    # Enshrouded 1.0 keeps its join password in the Default user group, not in
+    # AMP's generic ServerPassword field. Mark that configuration as externally
+    # authoritative so an empty generic setting cannot erase Quest Control's
+    # separately synchronized value. No role password is read or returned here.
+    enshrouded_candidates = (
+        instance_base / 'enshrouded' / '2278520' / 'enshrouded_server.json',
+        instance_base / 'enshrouded_server.json',
+    )
+    enshrouded_path = next(
+        (path for path in enshrouded_candidates if path.is_file()),
+        None,
+    )
+    if enshrouded_path is not None:
+        try:
+            if enshrouded_path.stat().st_size <= 256 * 1024:
+                payload = json.loads(
+                    enshrouded_path.read_text(encoding='utf-8-sig')
+                )
+                groups = payload.get('userGroups') if isinstance(payload, dict) else None
+                if isinstance(groups, list) and any(
+                    isinstance(group, dict)
+                    and str(group.get('name') or '').strip() == 'Default'
+                    for group in groups
+                ):
+                    result['enshrouded_default_role_password'] = True
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            logger.warning(
+                'read_kvp: could not parse Enshrouded server roles for %s',
+                instance_name,
+            )
     return result
 
 
@@ -364,91 +516,217 @@ async def _get_all_amp_instances() -> list:
         return []
 
 
-async def _get_server_status(instance_name: str, public_ip: str | None = None) -> dict:
-    """Return status dict for an instance."""
+def _extract_amp_server_password(setting) -> tuple[bool, str]:
+    """Extract AMP's authoritative player password.
+
+    Returns (False, '') when the setting is unavailable, so callers preserve
+    the last known DB value. Returns (True, '') when AMP explicitly has no
+    password, so an intentional clear still propagates.
+    """
+    if not isinstance(setting, dict):
+        return False, ''
+    node = setting.get('node', setting.get('Node'))
+    if node != AMP_SERVER_PASSWORD_NODE:
+        return False, ''
+    missing = object()
+    value = setting.get(
+        'current_value',
+        setting.get('CurrentValue', missing),
+    )
+    if value is missing:
+        return False, ''
+    return True, '' if value is None else str(value)
+
+
+async def _get_amp_server_password(instance, kvp: dict) -> str | None:
+    """Read the password from AMP, falling back to an explicit KVP value."""
+    if kvp.get('enshrouded_default_role_password'):
+        return None
+    try:
+        setting = await asyncio.wait_for(
+            instance.get_config(
+                AMP_SERVER_PASSWORD_NODE,
+                format_data=False,
+            ),
+            timeout=5,
+        )
+        found, password = _extract_amp_server_password(setting)
+        if found:
+            return password
+    except Exception as e:
+        logger.warning(
+            'AMP discovery: password lookup failed for %s: %s',
+            getattr(instance, 'instance_name', 'unknown'),
+            e,
+        )
+
+    # None means this source did not contain the setting. The discovery SQL
+    # must preserve the DB value in that case instead of replacing it with ''.
+    return kvp.get('server_password')
+
+
+async def _get_server_status(
+    instance_name: str,
+    public_ip: str | None = None,
+    fluxer_guild_id: str | None = None,
+) -> dict:
+    """Return status from Quest Control, which is the sole AMP API boundary."""
     result = {
         'state': 'Unknown', 'is_running': False, 'uptime': None,
         'cpu': None, 'ram_mb': None, 'ram_max_mb': None,
         'player_count': 0, 'player_max': 0, 'ip': None, 'port': None,
     }
-    instance = await _get_amp_instance(instance_name)
-    if not instance:
-        return result
-    try:
-        status = await instance.get_status(format_data=False)
-        # API returns lowercase snake_case keys with raw_value/max_value/percent
-        metrics = status.get('metrics', {})
-        result['uptime'] = status.get('uptime')
-        result['state'] = status.get('state', 'Unknown')
-        state_str = str(result['state']).strip()
-        result['is_running'] = state_str in ('Running', '5', '20') or 'running' in state_str.lower()
-        cpu_m = metrics.get('cpu_usage', {})
-        result['cpu'] = round(cpu_m.get('percent', 0), 1) if cpu_m else None
-        ram_m = metrics.get('memory_usage', {})
-        if ram_m:
-            result['ram_mb'] = ram_m.get('raw_value', 0)
-            result['ram_max_mb'] = ram_m.get('max_value', 0)
-        users_m = metrics.get('active_users', {})
-        if users_m:
-            result['player_count'] = int(users_m.get('raw_value', 0))
-            result['player_max'] = int(users_m.get('max_value', 0))
-    except Exception:
-        pass  # Instance offline or unreachable - result stays at defaults (is_running=False)
-    try:
-        import requests as _requests
-        ports = await instance.get_port_summaries(format_data=False)
-        # Exclude management/infra ports that are never the game connect port
-        _excluded = ('sftp', 'control panel', 'telnet', 'allocs', 'webserver', 'metrics')
-        valid_ports = [
-            p for p in (ports or [])
-            if not p.get('internalonly', False)
-            and p.get('port') is not None
-            and not any(ex in p.get('name', '').lower() for ex in _excluded)
-        ]
-        preferred_names = [
-            'server and steam port', 'game and mods port', 'game port',
-            'server port', 'query port',
-        ]
-        game_port = next(
-            (p for name in preferred_names for p in valid_ports
-             if name in p.get('name', '').lower()),
-            None
+    guild_id = str(fluxer_guild_id or '').strip()
+    if not guild_id or not QUEST_CONTROL_BOT_SECRET:
+        logger.error(
+            'Quest Control status disabled for %s: missing Fluxer guild or bot secret',
+            instance_name,
         )
-        if not game_port and valid_ports:
-            game_port = valid_ports[0]
-        if game_port:
-            raw_ip = (
-                game_port.get('ip') or game_port.get('hostname')
-                or game_port.get('address') or game_port.get('Address')
-            )
-            # AMP returns 0.0.0.0 when the server is binding all interfaces - use public_ip
-            # override from DB if set, otherwise fall back to ifconfig.me (bot's own IP)
-            if not raw_ip or raw_ip in ('0.0.0.0', '::'):
-                if public_ip:
-                    raw_ip = public_ip
-                else:
-                    try:
-                        raw_ip = _requests.get('https://ifconfig.me', timeout=5).text.strip()
-                    except Exception:
-                        raw_ip = None
-            result['ip']   = raw_ip
-            result['port'] = str(game_port.get('port', ''))
-    except Exception:
-        pass  # Instance offline - no port info available
+        return result
+    url = (
+        f"{QUESTLOG_INTERNAL_API_URL.rstrip('/')}"
+        '/api/internal/quest-control/server/'
+    )
+    try:
+        timeout = aiohttp.ClientTimeout(total=20)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(
+                url,
+                params={
+                    'instance': instance_name,
+                    'guild_id': guild_id,
+                    'platform': 'fluxer',
+                },
+                headers={'X-Bot-Secret': QUEST_CONTROL_BOT_SECRET},
+                allow_redirects=False,
+            ) as response:
+                payload = await response.json(content_type=None)
+                if response.status != 200 or not isinstance(payload, dict) or not payload.get('ok'):
+                    logger.warning(
+                        'Quest Control status rejected for %s guild=%s: HTTP %s',
+                        instance_name,
+                        guild_id,
+                        response.status,
+                    )
+                    return result
+        status = payload.get('status')
+        if not isinstance(status, dict):
+            return result
+        for key in result:
+            if key in status:
+                result[key] = status[key]
+        if isinstance(status.get('top_players'), list):
+            result['top_players'] = status['top_players'][:10]
+        if isinstance(status.get('server_password'), str):
+            result['server_password'] = status['server_password']
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
+        logger.warning(
+            'Quest Control status unavailable for %s: %s',
+            instance_name,
+            type(exc).__name__,
+        )
     return result
+
+
+async def _quest_control_server_action(
+    instance_name: str,
+    fluxer_guild_id: str,
+    action: str,
+) -> tuple[bool, str | None]:
+    """Request a tenant-bound lifecycle action through Quest Control."""
+    if not QUEST_CONTROL_BOT_SECRET:
+        return False, 'Quest Control bot authentication is not configured.'
+    url = (
+        f"{QUESTLOG_INTERNAL_API_URL.rstrip('/')}"
+        '/api/internal/quest-control/server/'
+    )
+    try:
+        timeout = aiohttp.ClientTimeout(total=100)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(
+                url,
+                json={
+                    'instance': instance_name,
+                    'guild_id': str(fluxer_guild_id),
+                    'action': action,
+                },
+                headers={'X-Bot-Secret': QUEST_CONTROL_BOT_SECRET},
+                allow_redirects=False,
+            ) as response:
+                payload = await response.json(content_type=None)
+                if not isinstance(payload, dict):
+                    return False, 'Quest Control returned an invalid response.'
+                if response.status == 200 and payload.get('ok'):
+                    return True, None
+                return False, str(payload.get('error') or f'HTTP {response.status}')
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
+        logger.warning(
+            'Quest Control action unavailable for %s action=%s: %s',
+            instance_name,
+            action,
+            type(exc).__name__,
+        )
+        return False, 'Quest Control is temporarily unavailable.'
 
 
 # ---------------------------------------------------------------------------
 # DB helpers (unified table)
 # ---------------------------------------------------------------------------
 
+_DEFAULT_BACKUP_WARNING_MINUTES = [15, 10, 5]
+
+
+def _parse_backup_warning_minutes(raw) -> list[int]:
+    """backup_warning_minutes is an admin-editable JSON array of integers, e.g.
+    '[15,10,5]' or '[30,20,10,5,1]' - falls back to the documented default
+    (15/10/5) only when genuinely unset, never hardcoded into the cycle logic."""
+    if not raw:
+        return list(_DEFAULT_BACKUP_WARNING_MINUTES)
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, list) and parsed:
+            vals = sorted({int(v) for v in parsed if int(v) > 0}, reverse=True)
+            if vals:
+                return vals
+    except (json.JSONDecodeError, TypeError, ValueError):
+        pass
+    return list(_DEFAULT_BACKUP_WARNING_MINUTES)
+
+
 def _load_all_configs() -> list[dict]:
     try:
         with db_session_scope() as db:
             rows = db.execute(text(
-                "SELECT * FROM gamebot_configs WHERE configured = 1 AND guild_id IS NOT NULL"
+                "SELECT * FROM gamebot_configs "
+                "WHERE configured = 1 "
+                "AND (discord_guild_id IS NOT NULL OR fluxer_guild_id IS NOT NULL)"
             )).fetchall()
-            return [dict(r._mapping) for r in rows]
+            configs = [dict(r._mapping) for r in rows]
+            for cfg in configs:
+                default_join, default_leave = _default_log_regexes(
+                    cfg.get('game_type', '')
+                )
+                updates = {}
+                if not cfg.get('join_regex') and default_join:
+                    updates['join_regex'] = default_join
+                    cfg['join_regex'] = default_join
+                if not cfg.get('leave_regex') and default_leave:
+                    updates['leave_regex'] = default_leave
+                    cfg['leave_regex'] = default_leave
+                if updates:
+                    set_clause = ', '.join(
+                        f'{field} = :{field}' for field in updates
+                    )
+                    updates['instance_name'] = cfg['instance_name']
+                    db.execute(text(
+                        f'UPDATE gamebot_configs SET {set_clause} '
+                        'WHERE instance_name = :instance_name'
+                    ), updates)
+                    logger.info(
+                        'Stored fallback join/leave parsers for %s',
+                        cfg['instance_name'],
+                    )
+            return configs
     except Exception as e:
         logger.error(f'_load_all_configs: {e}')
         return []
@@ -474,41 +752,75 @@ async def _has_permission(cfg: dict, ctx) -> bool:
     return await is_bot_manager(ctx, cfg)
 
 
-def _upsert_player(instance_name: str, guild_id: str, userid: str | None, username: str):
+def _upsert_player(
+    instance_name: str,
+    guild_id: str,
+    userid: str | None,
+    username: str,
+) -> bool:
+    # gamebot_players.guild_id is a legacy denormalized ownership key. Use either
+    # linked platform so Discord-only instances never write an empty guild id.
+    storage_userid = _normalize_player_id(userid) or f'name:{username}'[:64]
     try:
         with db_session_scope() as db:
             db.execute(text("""
                 INSERT INTO gamebot_players (instance_name, guild_id, userid, username)
                 VALUES (:inst, :g, :uid, :name)
                 ON DUPLICATE KEY UPDATE username=VALUES(username), last_seen=NOW()
-            """), {'inst': instance_name, 'g': guild_id, 'uid': userid or '', 'name': username})
+            """), {
+                'inst': instance_name,
+                'g': guild_id,
+                'uid': storage_userid,
+                'name': username,
+            })
+        return True
     except Exception as e:
         logger.error(f'_upsert_player: {e}')
+        return False
 
 
-def _remove_player(instance_name: str, userid: str | None, username: str | None):
+def _remove_player(
+    instance_name: str,
+    userid: str | None,
+    username: str | None,
+) -> bool:
     """Remove player by userid OR username - tries both so stale IDs don't block removal."""
+    normalized_userid = _normalize_player_id(userid)
+    if not normalized_userid and not username:
+        return False
     try:
         with db_session_scope() as db:
-            if userid:
-                db.execute(text(
-                    "DELETE FROM gamebot_players WHERE instance_name=:inst AND userid=:uid"
-                ), {'inst': instance_name, 'uid': userid})
-            if username:
-                db.execute(text(
-                    "DELETE FROM gamebot_players WHERE instance_name=:inst AND username=:name"
-                ), {'inst': instance_name, 'name': username})
+            result = db.execute(text("""
+                DELETE FROM gamebot_players
+                WHERE instance_name=:inst
+                  AND (
+                    (:uid IS NOT NULL AND userid=:uid)
+                    OR (:name IS NOT NULL AND username=:name)
+                  )
+            """), {
+                'inst': instance_name,
+                'uid': normalized_userid,
+                'name': username,
+            })
+            return bool(result.rowcount)
     except Exception as e:
         logger.error(f'_remove_player: {e}')
+        return False
 
 
 def _lookup_username_by_userid(instance_name: str, userid: str) -> str | None:
     """Look up a character name by Steam/user ID - used when leave log only gives userid."""
+    normalized_userid = _normalize_player_id(userid)
+    if not normalized_userid:
+        return None
     try:
         with db_session_scope() as db:
             row = db.execute(text(
                 "SELECT username FROM gamebot_players WHERE instance_name=:inst AND userid=:uid LIMIT 1"
-            ), {'inst': instance_name, 'uid': userid}).fetchone()
+            ), {
+                'inst': instance_name,
+                'uid': normalized_userid,
+            }).fetchone()
             return row.username if row else None
     except Exception:
         return None
@@ -556,12 +868,13 @@ async def discover_instances():
         join_regex   = kvp.get('Console.UserJoinRegex')
         leave_regex  = kvp.get('Console.UserLeaveRegex')
         display_name = getattr(inst, 'friendly_name', None) or kvp.get('Meta.DisplayName') or name
-        instance_base = next(
+        explicit_root = EXPLICIT_INSTANCE_ROOTS.get(name)
+        instance_base = explicit_root if explicit_root and explicit_root.exists() else next(
             (p / name for p in AMP_INSTANCES_PATHS if (p / name).exists()),
             AMP_INSTANCES_BASE / name
         )
         amp_log_dir  = str(instance_base / 'AMP_Logs')
-        server_pw    = kvp.get('server_password') or ''
+        server_pw    = await _get_amp_server_password(inst, kvp)
 
         # game_type from AMP module_display_name or Meta.DisplayName
         game_type = (
@@ -569,6 +882,9 @@ async def discover_instances():
             or display_name
             or 'Unknown'
         )
+        default_join_regex, default_leave_regex = _default_log_regexes(game_type)
+        join_regex = join_regex or default_join_regex
+        leave_regex = leave_regex or default_leave_regex
 
         try:
             with db_session_scope() as db:
@@ -583,10 +899,19 @@ async def discover_instances():
                         instance_id          = COALESCE(instance_id, VALUES(instance_id)),
                         game_type            = VALUES(game_type),
                         amp_log_dir          = VALUES(amp_log_dir),
-                        join_regex           = VALUES(join_regex),
-                        leave_regex          = VALUES(leave_regex),
+                        join_regex           = COALESCE(
+                            VALUES(join_regex),
+                            join_regex
+                        ),
+                        leave_regex          = COALESCE(
+                            VALUES(leave_regex),
+                            leave_regex
+                        ),
                         server_display_name  = VALUES(server_display_name),
-                        server_password      = VALUES(server_password)
+                        server_password      = COALESCE(
+                            VALUES(server_password),
+                            server_password
+                        )
                 """), {
                     'name':   name,
                     'iid':    getattr(inst, 'instance_id', None),
@@ -597,7 +922,14 @@ async def discover_instances():
                     'dname':  display_name,
                     'pw':     server_pw,
                 })
-            logger.info(f'AMP discovery: registered {name} ({game_type}), password={"set" if server_pw else "none"}')
+            password_state = (
+                'unchanged' if server_pw is None
+                else ('set' if server_pw else 'none')
+            )
+            logger.info(
+                f'AMP discovery: registered {name} ({game_type}), '
+                f'password={password_state}'
+            )
         except Exception as e:
             logger.error(f'AMP discovery upsert failed for {name}: {e}')
 
@@ -630,12 +962,23 @@ async def build_serverinfo_embed(cfg: dict) -> fluxer.Embed:
     color         = GAME_COLORS.get(game_type, DEFAULT_COLOR)
     game_emoji    = GAME_EMOJIS.get(game_type, DEFAULT_EMOJI)
 
-    status  = await _get_server_status(instance_name, public_ip=cfg.get('public_ip') or None)
+    status = await _get_server_status(
+        instance_name,
+        public_ip=cfg.get('public_ip') or None,
+        fluxer_guild_id=cfg.get('fluxer_guild_id'),
+    )
     players = _get_online_players(instance_name)
 
-    is_running  = status['is_running']
-    state_emoji = '🟢' if is_running else '🔴'
-    state_label = 'Online' if is_running else 'Offline'
+    is_running = status['is_running']
+    raw_state = str(status.get('state') or 'Unknown').strip()
+    if is_running:
+        state_emoji, state_label = '🟢', 'Online'
+    elif raw_state.lower() in {'stopped', 'offline', 'failed', 'suspended'}:
+        state_emoji, state_label = '🔴', 'Offline'
+    elif raw_state.lower() == 'unknown':
+        state_emoji, state_label = '⚪', 'Status unavailable'
+    else:
+        state_emoji, state_label = '🟡', raw_state
 
     embed = fluxer.Embed(
         title=f'{game_emoji} {display_name} Server Info',
@@ -659,9 +1002,10 @@ async def build_serverinfo_embed(cfg: dict) -> fluxer.Embed:
         connect = f"{status['ip']}:{status['port']}" if status.get('port') else status['ip']
         embed.add_field(name='IP Address', value=f"```{connect}```", inline=False)
 
-    # Password (if toggled on)
-    if cfg.get('show_password') and cfg.get('server_password'):
-        embed.add_field(name='Server Password', value=f"```{cfg['server_password']}```", inline=False)
+    # Quest Control includes the cached password only when show_password is enabled.
+    server_password = status.get('server_password')
+    if server_password:
+        embed.add_field(name='Server Password', value=f"```{server_password}```", inline=False)
 
     # Stats: CPU / RAM / Uptime
     if status['cpu'] is not None:
@@ -686,19 +1030,12 @@ async def build_serverinfo_embed(cfg: dict) -> fluxer.Embed:
             embed.add_field(name=f'Currently Online ({len(players)})', value='\n'.join(lines_out), inline=False)
         else:
             # No one online - show top players by playtime from AMP analytics
-            top_players = []
-            try:
-                instance = await _get_amp_instance(instance_name)
-                if instance:
-                    summary = await instance.get_analytics_summary(period_days=30)
-                    top_players = getattr(summary, 'top_players', [])
-            except Exception:
-                pass
+            top_players = status.get('top_players') or []
             if top_players:
                 tp_lines = '\n'.join(
-                    f"{i}. {p.username}  {p.display_session_time}"
-                    for i, p in enumerate(top_players[:10], 1)
-                    if getattr(p, 'username', '').strip()
+                    f"{i}. {player.get('username')}  {player.get('session_time', '')}".rstrip()
+                    for i, player in enumerate(top_players[:10], 1)
+                    if isinstance(player, dict) and player.get('username')
                 )
                 if tp_lines:
                     embed.add_field(name='Top Players by Playtime (30d)', value=tp_lines, inline=False)
@@ -758,13 +1095,9 @@ def _player_online(username: str) -> bool:
     return False
 
 async def _is_blood_moon(instance_name: str) -> bool:
-    try:
-        status = await _get_server_status(instance_name)
-        # blood moon check would require reading game time from logs
-        # preserved as stub
-        return False
-    except Exception:
-        return False
+    # Blood-moon detection requires game time, which AMP status does not expose.
+    # Preserve the existing disabled behavior without performing a useless status call.
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -778,17 +1111,94 @@ class GameServerCog(Cog):
         self._log_watchers: dict[str, LogWatcher] = {}
         self._spawn_delay_tasks: dict[str, asyncio.Task] = {}
         self._known_players: dict[str, set] = {}
+        self._background_tasks: dict[str, asyncio.Task] = {}
+        self._amp_console_instances: dict[str, object] = {}
+        self._amp_console_primed: set[str] = set()
+        self._amp_console_seen: dict[
+            str,
+            dict[tuple[str, str, str], float],
+        ] = {}
+        self._recent_player_events: dict[
+            tuple[str, str, str],
+            float,
+        ] = {}
+
+    def _claim_player_event(
+        self,
+        instance_name: str,
+        username: str,
+        userid: str | None,
+        joined: bool,
+    ) -> bool:
+        """Claim one real player transition and reject immediate replays."""
+        now = time.monotonic()
+        event = 'joined' if joined else 'left'
+        opposite = 'left' if joined else 'joined'
+        identity = _normalize_player_id(userid) or username.casefold()
+        key = (instance_name, event, identity)
+        opposite_key = (instance_name, opposite, identity)
+
+        # A real opposite transition makes the next matching event valid.
+        self._recent_player_events.pop(opposite_key, None)
+
+        previous = self._recent_player_events.get(key)
+        if previous is not None and now - previous < 300:
+            logger.warning(
+                'Suppressed replayed %s event for %s on %s',
+                event,
+                username,
+                instance_name,
+            )
+            return False
+
+        self._recent_player_events[key] = now
+        cutoff = now - 1800
+        self._recent_player_events = {
+            event_key: seen_at
+            for event_key, seen_at in self._recent_player_events.items()
+            if seen_at >= cutoff
+        }
+        return True
 
     # ---- Lifecycle ----
 
     @Cog.listener()
     async def on_ready(self):
-        logger.info('GameServerCog: starting auto-discovery and monitors')
-        asyncio.ensure_future(self._discovery_loop())
-        await asyncio.sleep(10)  # Let discovery run first
-        asyncio.ensure_future(self._status_monitor_loop())
-        asyncio.ensure_future(self._log_watcher_loop())
-        asyncio.ensure_future(self._daily_scheduler_loop())
+        """Start each long-running worker once.
+
+        Fluxer can emit on_ready again after a reconnect. Starting fresh loops on
+        every event caused duplicate backup cycles and duplicate AMP polling.
+        """
+        workers = {
+            'discovery': self._discovery_loop,
+            'status_monitor': self._status_monitor_loop,
+            'log_watcher': self._log_watcher_loop,
+            'daily_scheduler': self._daily_scheduler_loop,
+        }
+        started = []
+        for name, worker in workers.items():
+            task = self._background_tasks.get(name)
+            if task is None or task.done():
+                self._background_tasks[name] = asyncio.create_task(
+                    worker(),
+                    name=f'gameserver:{name}',
+                )
+                started.append(name)
+
+        if started:
+            logger.info(
+                'GameServerCog: started background workers: %s',
+                ', '.join(started),
+            )
+        else:
+            logger.info('GameServerCog: background workers already running')
+
+    async def cog_unload(self):
+        """Cancel workers when this cog is unloaded or reloaded."""
+        for task in self._background_tasks.values():
+            if task and not task.done():
+                task.cancel()
+        self._background_tasks.clear()
 
     # ---- Discovery loop ----
 
@@ -826,24 +1236,37 @@ class GameServerCog(Cog):
             return
         embed = await build_serverinfo_embed(cfg)
         old_msg_id = cfg.get('serverinfo_message_id')
+
+        def _is_channel_dead(err_str: str) -> bool:
+            """True when the channel/guild itself is gone or bot has no access - don't post new."""
+            return any(k in err_str for k in ('unknown_guild', 'unknown channel', 'access_denied', '403', 'forbidden'))
+
+        def _is_message_gone(err_str: str) -> bool:
+            """True when only the specific message is missing - safe to post a fresh one."""
+            return 'unknown message' in err_str and not _is_channel_dead(err_str)
+
         # Try to edit existing message so it stays pinned in place
         if old_msg_id:
             try:
                 await self.bot._http.edit_message(str(channel_id), str(old_msg_id), embeds=[embed.to_dict()])
                 return
             except Exception as e:
-                logger.warning(f'[monitor] edit_message failed for {instance_name} msg={old_msg_id}: {e!r}')
-                # Only post a new message if the old one was genuinely not found (404).
-                # For any other error (rate limit, server error) skip this cycle to
-                # avoid creating duplicate embeds.
                 err_str = str(e).lower()
-                if '404' not in err_str and 'unknown message' not in err_str:
-                    logger.debug(f'[monitor] Skipping new post for {instance_name} - non-404 edit failure')
+                logger.warning(f'[monitor] edit_message failed for {instance_name} msg={old_msg_id}: {e!r}')
+                if _is_channel_dead(err_str):
+                    # Channel/guild gone or no access - skip entirely, don't spam new messages
+                    logger.debug(f'[monitor] Channel dead for {instance_name} - skipping')
                     return
-                # 404 / unknown message - clear stored ID so we post fresh next cycle
-                _update_serverinfo_id(instance_name, None)
-                old_msg_id = None
-        # No existing message (or 404 cleared it) - post a new one
+                if _is_message_gone(err_str):
+                    # Only the message was deleted - clear ID and post fresh below
+                    _update_serverinfo_id(instance_name, None)
+                    old_msg_id = None
+                else:
+                    # Rate limit or transient error - skip this cycle
+                    logger.debug(f'[monitor] Transient error for {instance_name} - skipping cycle')
+                    return
+
+        # No existing message (or it was deleted) - post a new one
         try:
             resp = await self.bot._http.send_message(str(channel_id), embeds=[embed])
             new_id = resp.get('id') if isinstance(resp, dict) else None
@@ -852,6 +1275,95 @@ class GameServerCog(Cog):
             logger.error(f'[monitor] send_message failed for {instance_name}: {e}')
 
     # ---- Log watcher loop: one watcher per configured instance ----
+
+    async def _read_amp_console_lines(self, cfg: dict) -> list[str]:
+        """Read new console entries when an instance's log path is unavailable."""
+        instance_name = cfg['instance_name']
+        instance = self._amp_console_instances.get(instance_name)
+        if instance is None:
+            instance = await _get_amp_instance(instance_name)
+            if instance is None:
+                return []
+            self._amp_console_instances[instance_name] = instance
+
+        try:
+            updates = await asyncio.wait_for(
+                instance.get_updates(),
+                timeout=5,
+            )
+        except Exception as e:
+            logger.warning(
+                f'AMP console watcher failed for {instance_name}: {e}'
+            )
+            self._amp_console_instances.pop(instance_name, None)
+            self._amp_console_primed.discard(instance_name)
+            return []
+
+        entries = (
+            updates.get('console_entries', [])
+            if isinstance(updates, dict)
+            else getattr(updates, 'console_entries', [])
+        )
+
+        parsed_entries = []
+        is_minecraft = 'minecraft' in (
+            cfg.get('game_type', '').lower()
+        )
+        for entry in entries:
+            if isinstance(entry, dict):
+                contents = str(entry.get('contents') or '').strip()
+                source = str(entry.get('source') or '').strip()
+                timestamp = str(entry.get('timestamp') or '')
+            else:
+                contents = str(getattr(entry, 'contents', '') or '').strip()
+                source = str(getattr(entry, 'source', '') or '').strip()
+                timestamp = str(getattr(entry, 'timestamp', '') or '')
+            if not contents:
+                continue
+            signature = (timestamp, source, contents)
+            if is_minecraft:
+                time_match = re.search(r'T(\d{2}:\d{2}:\d{2})', timestamp)
+                display_time = time_match.group(1) if time_match else '00:00:00'
+                if source:
+                    contents = f'[{display_time}] [{source}]: {contents}'
+            parsed_entries.append((signature, contents))
+
+        seen = self._amp_console_seen.setdefault(instance_name, {})
+        now = time.monotonic()
+
+        # AMP can return recent history on the first call or after reconnecting.
+        # Remember those entries before priming so the next poll cannot replay
+        # the same join/leave lines.
+        if instance_name not in self._amp_console_primed:
+            for signature, _ in parsed_entries:
+                seen[signature] = now
+            self._amp_console_primed.add(instance_name)
+            logger.info(
+                f'AMP console watcher started for {instance_name}'
+            )
+            return []
+
+        lines = []
+        for signature, contents in parsed_entries:
+            timestamp = signature[0]
+            previous = seen.get(signature)
+            # Timestamped entries are stable AMP events. Some modules omit a
+            # timestamp, so only suppress those identical lines briefly.
+            if previous is not None and (
+                bool(timestamp) or now - previous < 60
+            ):
+                continue
+            seen[signature] = now
+            lines.append(contents)
+
+        if len(seen) > 4096:
+            newest = sorted(
+                seen.items(),
+                key=lambda item: item[1],
+                reverse=True,
+            )[:2048]
+            self._amp_console_seen[instance_name] = dict(newest)
+        return lines
 
     async def _log_watcher_loop(self):
         await asyncio.sleep(20)
@@ -863,14 +1375,26 @@ class GameServerCog(Cog):
                 try:
                     log_dir_exists = bool(log_dir) and Path(log_dir).exists()
                 except PermissionError:
-                    logger.warning(f'LogWatcher: permission denied on {log_dir} - fix with: sudo chmod o+rx {log_dir}')
-                    continue
+                    logger.warning(
+                        f'LogWatcher: permission denied on {log_dir}; '
+                        f'using AMP console feed for {instance_name}'
+                    )
+                    log_dir_exists = False
                 if not log_dir_exists:
+                    if instance_name not in self._known_players:
+                        self._known_players[instance_name] = set(
+                            _get_online_players(instance_name)
+                        )
+                    lines = await self._read_amp_console_lines(cfg)
+                    if lines:
+                        await self._process_log_lines(lines, cfg)
                     continue
                 if instance_name not in self._log_watchers:
                     try:
                         self._log_watchers[instance_name] = LogWatcher(log_dir)
-                        self._known_players[instance_name] = set()
+                        self._known_players[instance_name] = set(
+                            _get_online_players(instance_name)
+                        )
                         logger.info(f'LogWatcher started for {instance_name}')
                     except Exception as e:
                         logger.error(f'LogWatcher init {instance_name}: {e}')
@@ -884,36 +1408,130 @@ class GameServerCog(Cog):
                     logger.error(f'log_watcher_loop {instance_name}: {e}')
             await asyncio.sleep(3)
 
+    async def _send_join_leave_notice(
+        self,
+        cfg: dict,
+        username: str,
+        joined: bool,
+    ):
+        """Send one player event to every configured platform destination."""
+        if not cfg.get('alert_join_leave'):
+            return
+
+        instance_name = cfg['instance_name']
+        server_name = cfg.get('server_display_name') or instance_name
+        event = 'joined' if joined else 'left'
+        title = 'Player Joined' if joined else 'Player Left'
+        description = f'**{username}** {event} **{server_name}**'
+        color = GAME_COLORS.get(cfg.get('game_type', ''), DEFAULT_COLOR)
+
+        fluxer_channel = cfg.get('join_leave_fluxer_channel_id')
+        if cfg.get('fluxer_guild_id') and fluxer_channel:
+            try:
+                embed = fluxer.Embed(
+                    title=title,
+                    description=description,
+                    color=color,
+                )
+                embed.set_footer(
+                    text='Hosted by CasualHeroes - Powered by QuestLog'
+                )
+                await self.bot._http.send_message(
+                    str(fluxer_channel),
+                    embeds=[embed],
+                )
+            except Exception as e:
+                logger.error(
+                    f'join_leave fluxer send {instance_name}: {e}'
+                )
+
+        discord_channel = cfg.get('join_leave_discord_channel_id')
+        if cfg.get('discord_guild_id') and discord_channel:
+            try:
+                with db_session_scope() as db:
+                    db.execute(text(
+                        "INSERT INTO discord_pending_broadcasts "
+                        "(guild_id, channel_id, payload, created_at) "
+                        "VALUES (:g, :c, :p, :t)"
+                    ), {
+                        'g': int(cfg['discord_guild_id']),
+                        'c': int(discord_channel),
+                        'p': json.dumps({
+                            'action': 'direct',
+                            'title': title,
+                            'description': description,
+                            'color': color,
+                            'footer': (
+                                'Hosted by CasualHeroes - Powered by QuestLog'
+                            ),
+                        }),
+                        't': int(time.time()),
+                    })
+            except Exception as e:
+                logger.error(
+                    f'join_leave discord send {instance_name}: {e}'
+                )
+
     async def _process_log_lines(self, lines: list[str], cfg: dict):
         instance_name = cfg['instance_name']
-        join_pattern  = cfg.get('join_regex')
-        leave_pattern = cfg.get('leave_regex')
-        guild_id      = cfg.get('guild_id', '')
-        notif_channel = cfg.get('notif_channel_id')
+        known_players = self._known_players.setdefault(
+            instance_name,
+            set(),
+        )
+        default_join, default_leave = _default_log_regexes(
+            cfg.get('game_type', '')
+        )
+        join_pattern = cfg.get('join_regex') or default_join
+        leave_pattern = cfg.get('leave_regex') or default_leave
+        player_guild_id = (
+            cfg.get('discord_guild_id')
+            or cfg.get('fluxer_guild_id')
+            or ''
+        )
 
-        join_re  = re.compile(join_pattern)  if join_pattern  else None
-        leave_re = re.compile(leave_pattern) if leave_pattern else None
+        try:
+            join_re = re.compile(join_pattern) if join_pattern else None
+        except re.error as e:
+            logger.error(
+                f'Invalid join regex for {instance_name}: {e}'
+            )
+            join_re = None
+        try:
+            leave_re = re.compile(leave_pattern) if leave_pattern else None
+        except re.error as e:
+            logger.error(
+                f'Invalid leave regex for {instance_name}: {e}'
+            )
+            leave_re = None
 
         for line in lines:
             # --- Join ---
             if join_re:
                 m = join_re.search(line)
                 if m:
-                    username = (m.groupdict().get('username') or '').strip()
-                    userid   = (m.groupdict().get('userid') or '').strip() or None
-                    if username and username not in self._known_players[instance_name]:
-                        self._known_players[instance_name].add(username)
-                        _upsert_player(instance_name, guild_id, userid, username)
-                        if notif_channel and cfg.get('alert_join_leave'):
-                            color = GAME_COLORS.get(cfg.get('game_type', ''), DEFAULT_COLOR)
-                            embed = fluxer.Embed(
-                                description=f'**{username}** joined **{cfg.get("server_display_name") or cfg["instance_name"]}**',
-                                color=color,
+                    username = _capture(m, 'username')
+                    userid = _normalize_player_id(
+                        _capture(m, 'userid') or None
+                    )
+                    if username and username not in known_players:
+                        known_players.add(username)
+                        _upsert_player(
+                            instance_name,
+                            player_guild_id,
+                            userid,
+                            username,
+                        )
+                        if self._claim_player_event(
+                            instance_name,
+                            username,
+                            userid,
+                            joined=True,
+                        ):
+                            await self._send_join_leave_notice(
+                                cfg,
+                                username,
+                                joined=True,
                             )
-                            try:
-                                await self.bot._http.send_message(str(notif_channel), embeds=[embed])
-                            except Exception as e:
-                                logger.error(f'join notify {instance_name}: {e}')
                         # 7DTD: cancel spawn delay to trigger sooner when player joins
                         if '7dtd' in instance_name.lower() or 'sdtd' in instance_name.lower():
                             t = self._spawn_delay_tasks.get(instance_name)
@@ -925,45 +1543,58 @@ class GameServerCog(Cog):
             if leave_re:
                 m = leave_re.search(line)
                 if m:
-                    username = (m.groupdict().get('username') or '').strip()
-                    userid   = (m.groupdict().get('userid') or '').strip() or None
+                    username = _capture(m, 'username')
+                    userid = _normalize_player_id(
+                        _capture(m, 'userid') or None
+                    )
                     # If regex has no username group (e.g. V Rising only gives Steam ID on disconnect)
                     # look up the character name from DB using userid
                     if not username and userid:
                         username = _lookup_username_by_userid(instance_name, userid) or ''
                     if username:
-                        self._known_players[instance_name].discard(username)
+                        known_players.discard(username)
                         _remove_player(instance_name, userid, username)
-                        if notif_channel and cfg.get('alert_join_leave'):
-                            color = GAME_COLORS.get(cfg.get('game_type', ''), DEFAULT_COLOR)
-                            server_name = cfg.get("server_display_name") or cfg["instance_name"]
-                            desc = f'**{username}** left **{server_name}**'
-                            embed = fluxer.Embed(description=desc, color=color)
-                            try:
-                                await self.bot._http.send_message(str(notif_channel), embeds=[embed])
-                            except Exception as e:
-                                logger.error(f'leave notify {instance_name}: {e}')
+                        if self._claim_player_event(
+                            instance_name,
+                            username,
+                            userid,
+                            joined=False,
+                        ):
+                            await self._send_join_leave_notice(
+                                cfg,
+                                username,
+                                joined=False,
+                            )
 
         # --- Live log forwarding ---
-        live_log_channel = cfg.get('live_log_channel_id')
-        if live_log_channel and cfg.get('alert_live_logs'):
+        # Platform-specific channels, routed independently - a Discord channel picked
+        # here has no meaning to this bot's own send path (Fluxer only), so it goes
+        # through the same discord_pending_broadcasts outbox _send_backup_notice uses.
+        if cfg.get('alert_live_logs'):
             filtered = _filter_live_log_lines(lines)
             if filtered:
-                # Batch into chunks of max 1900 chars to stay under message limit
-                chunk = ''
-                for line in filtered:
-                    if len(chunk) + len(line) + 1 > 1900:
+                for chunk in _chunk_log_lines(filtered):
+                    fluxer_channel = cfg.get('live_log_fluxer_channel_id')
+                    if fluxer_channel and cfg.get('fluxer_guild_id'):
                         try:
-                            await self.bot._http.send_message(str(live_log_channel), content=f'```\n{chunk}\n```')
+                            await self.bot._http.send_message(str(fluxer_channel), content=f'```\n{chunk}\n```')
                         except Exception as e:
-                            logger.error(f'live_log send {instance_name}: {e}')
-                        chunk = ''
-                    chunk += line + '\n'
-                if chunk:
-                    try:
-                        await self.bot._http.send_message(str(live_log_channel), content=f'```\n{chunk}\n```')
-                    except Exception as e:
-                        logger.error(f'live_log send {instance_name}: {e}')
+                            logger.error(f'live_log fluxer send {instance_name}: {e}')
+
+                    discord_channel = cfg.get('live_log_discord_channel_id')
+                    if discord_channel and cfg.get('discord_guild_id'):
+                        try:
+                            with db_session_scope() as db:
+                                db.execute(text(
+                                    "INSERT INTO discord_pending_broadcasts (guild_id, channel_id, payload, created_at) "
+                                    "VALUES (:g, :c, :p, :t)"
+                                ), {
+                                    'g': int(cfg['discord_guild_id']), 'c': int(discord_channel),
+                                    'p': json.dumps({'action': 'direct', 'description': f'```\n{chunk}\n```', 'color': DEFAULT_COLOR}),
+                                    't': int(time.time()),
+                                })
+                        except Exception as e:
+                            logger.error(f'live_log discord send {instance_name}: {e}')
 
     # ---- 7DTD auto zombie spawn ----
 
@@ -1029,6 +1660,35 @@ class GameServerCog(Cog):
 
     # ---- Daily scheduler ----
 
+    async def _poll_manual_backup_requests(self, configs: list[dict]):
+        """Admin-triggered 'Run Backup Cycle Now' button in Quest Control - inserts a row
+        into gamebot_backup_run_requests, we consume it here and kick off the same warned
+        cycle the scheduler would, entirely independent of backup_hour/backup_minute. This
+        exists for testing and for catching a missed scheduler window without waiting a day."""
+        try:
+            with db_session_scope() as db:
+                rows = db.execute(text(
+                    "SELECT id, instance_name FROM gamebot_backup_run_requests WHERE consumed_at IS NULL"
+                )).fetchall()
+                if not rows:
+                    return
+                ids = [r[0] for r in rows]
+                db.execute(text(
+                    "UPDATE gamebot_backup_run_requests SET consumed_at = :t WHERE id IN :ids"
+                ).bindparams(bindparam('ids', expanding=True)), {'t': int(time.time()), 'ids': ids})
+                db.commit()
+        except Exception as e:
+            logger.error(f'_poll_manual_backup_requests fetch: {e}')
+            return
+
+        for row_id, instance_name in rows:
+            cfg = next((c for c in configs if c['instance_name'] == instance_name), None)
+            if not cfg:
+                logger.warning(f'Manual backup run requested for unknown instance {instance_name}')
+                continue
+            logger.info(f'Manual backup run requested for {instance_name}')
+            asyncio.ensure_future(self._run_warned_backup_cycle(cfg, backup_days=None))
+
     async def _daily_scheduler_loop(self):
         await asyncio.sleep(30)
         _last_settings_run: dict[str, str] = {}
@@ -1037,28 +1697,43 @@ class GameServerCog(Cog):
             configs = _load_all_configs()
             now = datetime.datetime.now()
             today_key = now.strftime('%Y-%m-%d')
+
+            await self._poll_manual_backup_requests(configs)
+
             for cfg in configs:
                 instance_name = cfg['instance_name']
-                if not cfg.get('schedule_enabled', 1):
-                    continue
                 sched_h = cfg.get('scheduler_hour', 3)
                 sched_m = cfg.get('scheduler_minute', 27)
                 backup_h = cfg.get('backup_hour', 23)
                 backup_m = cfg.get('backup_minute', 30)
 
-                # Settings run
-                settings_key = f'settings:{instance_name}:{today_key}'
-                if now.hour == sched_h and now.minute == sched_m:
-                    if _last_settings_run.get(settings_key) != today_key:
-                        _last_settings_run[settings_key] = today_key
-                        try:
-                            await self._apply_daily_settings(cfg)
-                        except Exception as e:
-                            logger.error(f'daily_scheduler settings {instance_name}: {e}')
+                # Settings run - schedule_enabled ONLY gates this (per-day settings
+                # presets). It must NOT also gate the backup run below - those are
+                # two distinct features that happen to share this loop, and an
+                # instance with no settings presets built yet (so its admin turns
+                # this off) should still get its nightly backups.
+                if cfg.get('schedule_enabled', 1):
+                    settings_key = f'settings:{instance_name}:{today_key}'
+                    if now.hour == sched_h and now.minute == sched_m:
+                        if _last_settings_run.get(settings_key) != today_key:
+                            _last_settings_run[settings_key] = today_key
+                            try:
+                                await self._apply_daily_settings(cfg)
+                            except Exception as e:
+                                logger.error(f'daily_scheduler settings {instance_name}: {e}')
 
-                # Backup run
+                # Backup run - backups_enabled=1 uses the warned stop/backup/start
+                # cycle instead of the live in-place backup, fully replacing it for
+                # that instance. It's triggered (max warning minutes) BEFORE the
+                # configured backup_hour:backup_minute, not at it, so the LAST warning
+                # (and the actual stop/backup) lands exactly at the admin-configured
+                # time - the lead time is per-instance, admin-editable, not hardcoded.
                 backup_key = f'backup:{instance_name}:{today_key}'
-                if now.hour == backup_h and now.minute == backup_m:
+                scheduled_dt = now.replace(hour=backup_h, minute=backup_m, second=0, microsecond=0)
+                lead_minutes = max(_parse_backup_warning_minutes(cfg.get('backup_warning_minutes')), default=0)
+                trigger_dt = scheduled_dt - datetime.timedelta(minutes=lead_minutes)
+                is_trigger_time = now.hour == trigger_dt.hour and now.minute == trigger_dt.minute
+                if is_trigger_time:
                     if _last_backup_run.get(backup_key) != today_key:
                         _last_backup_run[backup_key] = today_key
                         backup_days = None
@@ -1070,7 +1745,10 @@ class GameServerCog(Cog):
                             except Exception:
                                 pass
                         try:
-                            await self._run_backup(cfg, backup_days=backup_days)
+                            if cfg.get('backups_enabled'):
+                                asyncio.ensure_future(self._run_warned_backup_cycle(cfg, backup_days=backup_days))
+                            else:
+                                await self._run_backup(cfg, backup_days=backup_days)
                         except Exception as e:
                             logger.error(f'daily_scheduler backup {instance_name}: {e}')
 
@@ -1082,7 +1760,7 @@ class GameServerCog(Cog):
         instance = await _get_amp_instance(instance_name)
         if not instance:
             return
-        day_name = datetime.datetime.utcnow().strftime('%A')
+        day_name = datetime.datetime.now().strftime('%A')
         logger.info(f'Daily settings scheduler: {instance_name} - {day_name}')
 
         overrides = {}
@@ -1113,47 +1791,590 @@ class GameServerCog(Cog):
         instance = await _get_amp_instance(instance_name)
         if not instance:
             return
-        day_name = datetime.datetime.utcnow().strftime('%A')
+        day_name = datetime.datetime.now().strftime('%A')
         if backup_days is not None and day_name not in backup_days:
             logger.info(f'Backup scheduler: skipping {instance_name} on {day_name} (not in backup_days)')
             return
         logger.info(f'Backup scheduler: taking backup for {instance_name} on {day_name}')
-        try:
-            await instance.take_backup(
-                f'Auto-{day_name}',
-                f'Scheduled daily backup ({day_name})',
-                False
-            )
-        except Exception as e:
-            logger.error(f'_run_backup {instance_name}: {e}')
 
-        # Post update to channel
-        update_channel = cfg.get('server_update_channel_id')
-        if update_channel:
-            color = GAME_COLORS.get(cfg.get('game_type', ''), DEFAULT_COLOR)
-            display = cfg.get('server_display_name') or cfg['instance_name']
-            embed = fluxer.Embed(
-                title=f'Daily Restart - {display}',
-                description=f'Server restarted for {day_name}. Backup taken.',
-                color=color,
-            )
-            if overrides:
-                embed.add_field(
-                    name='Settings Applied',
-                    value='\n'.join(f'`{k}` = `{v}`' for k, v in list(overrides.items())[:8]),
-                    inline=False,
-                )
-            embed.set_footer(text='QuestLogFluxer auto-scheduler')
+        backup_ok = await self._take_backup_and_wait(
+            cfg,
+            instance,
+            f'Auto-{day_name}',
+            f'Scheduled daily backup ({day_name})',
+        )
+        if not backup_ok:
+            logger.error(f'_run_backup: no completed backup found for {instance_name}')
+            return
+
+        try:
+            await self._mirror_latest_backup(cfg)
+        except Exception as e:
+            logger.error(f'_run_backup mirror {instance_name}: {e}')
+
+        try:
+            await self._prune_amp_backups(instance)
+        except Exception as e:
+            logger.error(f'_run_backup prune {instance_name}: {e}')
+
+        # Post update to channel - platform-specific, routed independently (this
+        # legacy non-warned path has no per-day override data available, unlike
+        # _apply_daily_settings, so there's no "Settings Applied" field here).
+        color = GAME_COLORS.get(cfg.get('game_type', ''), DEFAULT_COLOR)
+        display = cfg.get('server_display_name') or cfg['instance_name']
+        description = f'Scheduled backup taken for {day_name}.'
+
+        fluxer_channel = cfg.get('server_update_fluxer_channel_id')
+        if fluxer_channel and cfg.get('fluxer_guild_id'):
             try:
-                await self.bot._http.send_message(str(update_channel), embeds=[embed])
+                embed = fluxer.Embed(title=f'Daily Restart - {display}', description=description, color=color)
+                embed.set_footer(text='Hosted by CasualHeroes - Powered by QuestLog')
+                await self.bot._http.send_message(str(fluxer_channel), embeds=[embed])
             except Exception as e:
-                logger.error(f'daily update post {instance_name}: {e}')
+                logger.error(f'daily update fluxer post {instance_name}: {e}')
+
+        discord_channel = cfg.get('server_update_discord_channel_id')
+        if discord_channel and cfg.get('discord_guild_id'):
+            try:
+                with db_session_scope() as db:
+                    db.execute(text(
+                        "INSERT INTO discord_pending_broadcasts (guild_id, channel_id, payload, created_at) "
+                        "VALUES (:g, :c, :p, :t)"
+                    ), {
+                        'g': int(cfg['discord_guild_id']), 'c': int(discord_channel),
+                        'p': json.dumps({
+                            'action': 'direct',
+                            'title': f'Daily Restart - {display}', 'description': description,
+                            'color': color, 'footer': 'Hosted by CasualHeroes - Powered by QuestLog',
+                        }),
+                        't': int(time.time()),
+                    })
+            except Exception as e:
+                logger.error(f'daily update discord post {instance_name}: {e}')
+
+    # ---- Warned backup cycle (backups_enabled=1) ----
+    # Full stop/backup/start cycle with player-facing warnings, replacing the
+    # live-backup-while-running path (_run_backup) for any instance with
+    # backups_enabled=1. Fires at T-15/10/5 minutes before backup_hour:backup_minute,
+    # then at T-0 stops the server, backs it up, restarts it, and confirms online.
+    # Each stage posts to whichever of Discord/Fluxer this instance is linked to
+    # (discord_guild_id/fluxer_guild_id + their respective channel fields), and
+    # optionally sends an in-game broadcast via AMP console if rcon_broadcast_enabled.
+
+    # Defaults used only when the admin hasn't customized a given embed's title/description
+    # via Quest Control's Backups tab - so out-of-the-box behavior is unchanged, but every
+    # word of it is one save away from being fully admin-controlled, never hardcoded here.
+    _BACKUP_EMBED_DEFAULTS = {
+        'warn':   {'title': '{server}', 'description': '{server} will go down in {minutes} minutes for nightly backups. ({time})', 'color': None},
+        'down':   {'title': '{server}', 'description': '{server} going down now for nightly backups...', 'color': None},
+        'online': {'title': '{server}', 'description': '{server} is now online - have fun!', 'color': None},
+    }
+
+    def _resolve_backup_embed(self, cfg: dict, kind: str, minutes_left: int = 0, backup_epoch: int = 0) -> dict:
+        """Build the {title, description, color} for one of the 3 backup-cycle embeds
+        (warn/down/online), starting from this instance's admin-configured text and
+        substituting {server}/{minutes}/{time} placeholders. Falls back to the stock
+        message for any field left blank."""
+        instance_name = cfg['instance_name']
+        display = cfg.get('server_display_name') or instance_name
+        defaults = self._BACKUP_EMBED_DEFAULTS[kind]
+
+        title = (cfg.get(f'backup_{kind}_embed_title') or '').strip() or defaults['title']
+        description = (cfg.get(f'backup_{kind}_embed_description') or '').strip() or defaults['description']
+        color_hex = (cfg.get(f'backup_{kind}_embed_color') or '').strip()
+        try:
+            color = int(color_hex.lstrip('#'), 16) if color_hex else GAME_COLORS.get(cfg.get('game_type', ''), DEFAULT_COLOR)
+        except ValueError:
+            color = GAME_COLORS.get(cfg.get('game_type', ''), DEFAULT_COLOR)
+
+        # {time} is a Discord-native <t:unix:t> timestamp - Discord renders it in each
+        # viewer's own local timezone client-side. Fluxer has no equivalent markup, so
+        # it gets a plain UTC fallback instead.
+        discord_time = f'<t:{backup_epoch}:t>' if backup_epoch else ''
+        fluxer_time = datetime.datetime.utcfromtimestamp(backup_epoch).strftime('%H:%M UTC') if backup_epoch else ''
+
+        def _fill(text_, time_str):
+            return (text_.replace('{server}', display)
+                          .replace('{minutes}', str(minutes_left))
+                          .replace('{time}', time_str))
+
+        return {
+            'title_discord': _fill(title, discord_time), 'description_discord': _fill(description, discord_time),
+            'title_fluxer': _fill(title, fluxer_time), 'description_fluxer': _fill(description, fluxer_time),
+            'color': color,
+        }
+
+    async def _send_backup_notice(self, cfg: dict, kind: str, minutes_left: int = 0,
+                                   backup_epoch: int = 0, include_rcon: bool = True, rcon_text: str = ''):
+        """Post the admin-configured `kind` embed ('warn'/'down'/'online') to this
+        instance's linked Discord channel, Fluxer channel, and in-game broadcast (if
+        enabled) - whichever are configured. Best-effort: a failure on one destination
+        doesn't block the others."""
+        instance_name = cfg['instance_name']
+        resolved = self._resolve_backup_embed(cfg, kind, minutes_left, backup_epoch)
+
+        # Fluxer channel (this bot's own send path) - dedicated field, distinct from
+        # server_update_channel_id/notif_channel_id which are used by other features.
+        fluxer_channel = cfg.get('backup_notice_fluxer_channel_id')
+        if cfg.get('fluxer_guild_id') and fluxer_channel:
+            try:
+                embed = fluxer.Embed(title=resolved['title_fluxer'], description=resolved['description_fluxer'], color=resolved['color'])
+                embed.set_footer(text='Hosted by CasualHeroes - Powered by QuestLog')
+                await self.bot._http.send_message(str(fluxer_channel), embeds=[embed])
+            except Exception as e:
+                logger.error(f'_send_backup_notice fluxer {instance_name}: {e}')
+
+        # Discord channel - queued via discord_pending_broadcasts, same outbox
+        # pattern the QuestLog admin site already uses for cross-bot messaging,
+        # since this cog has no direct Discord connection of its own.
+        discord_channel = cfg.get('backup_notice_discord_channel_id')
+        if cfg.get('discord_guild_id') and discord_channel:
+            try:
+                with db_session_scope() as db:
+                    db.execute(text(
+                        "INSERT INTO discord_pending_broadcasts (guild_id, channel_id, payload, created_at) "
+                        "VALUES (:g, :c, :p, :t)"
+                    ), {
+                        'g': int(cfg['discord_guild_id']), 'c': int(discord_channel),
+                        # network_broadcasts.py on WardenBot reads embed fields directly off
+                        # the top-level payload (title/description/color) - no 'embed' wrapper.
+                        # action='direct' posts a plain embed to the channel - without it,
+                        # the consumer's default behavior creates a new thread per message
+                        # (its LFG-group posting pattern), which is wrong for a status notice.
+                        'p': json.dumps({
+                            'action': 'direct',
+                            'title': resolved['title_discord'], 'description': resolved['description_discord'],
+                            'color': resolved['color'], 'footer': 'Hosted by CasualHeroes - Powered by QuestLog',
+                        }),
+                        't': int(time.time()),
+                    })
+            except Exception as e:
+                logger.error(f'_send_backup_notice discord {instance_name}: {e}')
+
+        # In-game broadcast via AMP console - admin-authored message/command,
+        # since broadcast syntax differs per game and we don't hardcode it here.
+        if include_rcon and cfg.get('rcon_broadcast_enabled') and cfg.get('rcon_broadcast_message'):
+            try:
+                instance = await _get_amp_instance(instance_name)
+                if instance:
+                    rcon_msg = cfg['rcon_broadcast_message'].replace('{message}', rcon_text or resolved['description_fluxer'])
+                    await instance.send_console_message(rcon_msg)
+            except Exception as e:
+                logger.error(f'_send_backup_notice rcon {instance_name}: {e}')
+
+    @staticmethod
+    def _latest_amp_backup_snapshot(cfg: dict):
+        """Return a stable identity for the newest local AMP backup archive."""
+        amp_log_dir = cfg.get('amp_log_dir')
+        if not amp_log_dir:
+            return None
+        backups_dir = Path(amp_log_dir).parent / 'Backups'
+        try:
+            zips = sorted(backups_dir.glob('*.zip'), key=lambda path: path.stat().st_mtime_ns)
+            if not zips:
+                return None
+            latest = zips[-1]
+            stat = latest.stat()
+            return (str(latest), stat.st_mtime_ns, stat.st_size)
+        except OSError as e:
+            logger.error(
+                '_latest_amp_backup_snapshot: unable to inspect %s: %s',
+                backups_dir,
+                e,
+            )
+            return None
+
+    async def _take_backup_and_wait(
+        self,
+        cfg: dict,
+        instance,
+        name: str,
+        description: str,
+    ) -> bool:
+        """Make quota room, submit an AMP backup, and confirm a new archive.
+
+        AMP accepts backup requests asynchronously. The configured wait belongs
+        before mirroring, otherwise the mirror can copy yesterday's archive
+        while the new one is still being written.
+        """
+        instance_name = cfg['instance_name']
+
+        # Retain at most two ordinary backups before asking AMP to create the
+        # third. This prevents a full AMP quota from rejecting the new archive.
+        prune_ok = await self._prune_amp_backups(
+            instance,
+            max_kept=max(0, self.MAX_KEPT_BACKUPS - 1),
+        )
+        if not prune_ok:
+            logger.warning(
+                '_take_backup_and_wait: pre-backup retention failed for %s; '
+                'continuing so AMP can report the authoritative result',
+                instance_name,
+            )
+
+        before = self._latest_amp_backup_snapshot(cfg)
+        try:
+            result = await instance.take_backup(name, description, False)
+        except Exception as e:
+            logger.error(f'_take_backup_and_wait {instance_name}: {e}')
+            return False
+
+        if not bool(getattr(result, 'status', False)):
+            logger.error(
+                '_take_backup_and_wait: AMP rejected %s: %s',
+                instance_name,
+                getattr(result, 'reason', 'unknown'),
+            )
+            return False
+
+        wait_after_backup = int(cfg.get('backup_wait_after_backup_sec') or 300)
+        await asyncio.sleep(max(0, wait_after_backup))
+
+        after = self._latest_amp_backup_snapshot(cfg)
+        if cfg.get('amp_log_dir') and (after is None or after == before):
+            logger.error(
+                '_take_backup_and_wait: AMP accepted %s but no new completed '
+                'backup archive appeared after %s seconds',
+                instance_name,
+                wait_after_backup,
+            )
+            return False
+
+        return True
+
+    async def _mirror_latest_backup(self, cfg: dict):
+        """Copy the AMP backup that was just taken to both backup drives. AMP's
+        Backups/ folder is a sibling of AMP_Logs (derived from amp_log_dir, which
+        is already known-correct per-instance - no new config field needed). Runs
+        the actual file copy in a thread since it's blocking I/O, potentially over
+        NFS for remote-hosted instances.
+
+        Safety: copies to a .partial temp name first, verifies the byte count
+        matches the source, then atomically renames into place - a crash or network
+        blip mid-copy never leaves a half-written file at the real destination path.
+        Copies to each of the two drives independently: a failure on one (e.g. one
+        drive is full or offline) never blocks the other from succeeding. The
+        original AMP backup file is only ever read, never modified or deleted.
+        """
+        instance_name = cfg['instance_name']
+        amp_log_dir = cfg.get('amp_log_dir')
+        if not amp_log_dir:
+            logger.warning(f'_mirror_latest_backup: no amp_log_dir configured for {instance_name}, skipping mirror')
+            return
+
+        backups_dir = Path(amp_log_dir).parent / 'Backups'
+
+        def _find_latest_and_copy():
+            if not backups_dir.is_dir():
+                logger.warning(f'_mirror_latest_backup: {backups_dir} does not exist for {instance_name}, skipping mirror')
+                return
+            zips = sorted(backups_dir.glob('*.zip'), key=lambda p: p.stat().st_mtime)
+            if not zips:
+                logger.warning(f'_mirror_latest_backup: no backup zips found in {backups_dir} for {instance_name}')
+                return
+            latest = zips[-1]
+            src_size = latest.stat().st_size
+
+            # One drive at a time, with a short pause and up to 2 retries per
+            # drive - a transient "Read-only file system" blip (seen once on
+            # both /backup drives simultaneously, cause unconfirmed - possibly
+            # a hypervisor-level hiccup since these are virtio disks) shouldn't
+            # silently skip a mirror if the drive recovers a moment later.
+            for drive_root in ('/backup/primary2tb', '/backup/secondary4tb'):
+                dest_dir = Path(drive_root) / instance_name
+                dest_final = dest_dir / latest.name
+                dest_partial = dest_dir / (latest.name + '.partial')
+
+                if dest_final.exists() and dest_final.stat().st_size == src_size:
+                    logger.info(f'_mirror_latest_backup: {latest.name} already mirrored to {drive_root}, skipping')
+                    continue
+
+                max_attempts = 3
+                for attempt in range(1, max_attempts + 1):
+                    try:
+                        dest_dir.mkdir(parents=True, exist_ok=True)
+                        with open(latest, 'rb') as src_f, open(dest_partial, 'wb') as dst_f:
+                            while True:
+                                chunk = src_f.read(8 * 1024 * 1024)
+                                if not chunk:
+                                    break
+                                dst_f.write(chunk)
+                        copied_size = dest_partial.stat().st_size
+                        if copied_size != src_size:
+                            logger.error(
+                                f'_mirror_latest_backup: size mismatch copying {latest.name} to {drive_root} '
+                                f'(src={src_size} copied={copied_size}) - leaving .partial file, NOT renaming'
+                            )
+                            break
+                        dest_partial.rename(dest_final)
+                        logger.info(f'_mirror_latest_backup: mirrored {latest.name} ({src_size} bytes) to {drive_root} for {instance_name}')
+                        break
+                    except Exception as e:
+                        if attempt < max_attempts:
+                            logger.warning(
+                                f'_mirror_latest_backup: attempt {attempt}/{max_attempts} failed copying '
+                                f'{latest.name} to {drive_root} for {instance_name}: {e} - retrying in 10s'
+                            )
+                            time.sleep(10)
+                        else:
+                            logger.error(
+                                f'_mirror_latest_backup: all {max_attempts} attempts failed copying '
+                                f'{latest.name} to {drive_root} for {instance_name}: {e}'
+                            )
+
+                # Brief pause before moving to the next drive, in case writing
+                # to both back-to-back with no gap is what triggered the blip.
+                time.sleep(3)
+
+        try:
+            await asyncio.get_event_loop().run_in_executor(None, _find_latest_and_copy)
+        except Exception as e:
+            logger.error(f'_mirror_latest_backup: unexpected error for {instance_name}: {e}')
+
+        try:
+            await self._prune_mirrored_backups(instance_name)
+        except Exception as e:
+            logger.error(f'_mirror_latest_backup: prune mirrored failed for {instance_name}: {e}')
+
+    MAX_KEPT_BACKUPS = 3
+
+    async def _prune_amp_backups(self, instance, max_kept: int | None = None):
+        """Delete AMP's own stored backups down to the MAX_KEPT_BACKUPS newest,
+        oldest-first. Sticky backups are never counted or deleted - an admin
+        marked those as keep-forever, so they're excluded from both the "how
+        many do we have" count and the deletion candidates entirely.
+
+        AMP added fields such as parent_manifest to its backup response before
+        the installed ampapi package added them to its Backup dataclass. Request
+        raw dictionaries here so a new optional AMP field cannot disable
+        retention and eventually fill the instance's backup quota.
+        """
+        try:
+            backups = await instance.get_backups(format_data=False)
+        except Exception as e:
+            logger.error(f'_prune_amp_backups: get_backups failed: {e}')
+            return False
+
+        if not isinstance(backups, list):
+            logger.error(
+                '_prune_amp_backups: unexpected response type %s',
+                type(backups).__name__,
+            )
+            return False
+
+        def _field(backup, *names, default=None):
+            if isinstance(backup, dict):
+                for name in names:
+                    if name in backup:
+                        return backup[name]
+                return default
+            for name in names:
+                if hasattr(backup, name):
+                    return getattr(backup, name)
+            return default
+
+        keep_count = self.MAX_KEPT_BACKUPS if max_kept is None else max(0, int(max_kept))
+        non_sticky = [
+            backup for backup in backups
+            if not bool(_field(backup, 'sticky', 'Sticky', default=False))
+        ]
+        non_sticky.sort(
+            key=lambda backup: str(_field(
+                backup,
+                'timestamp',
+                'Timestamp',
+                default='',
+            ))
+        )
+        to_delete = non_sticky[:-keep_count] if keep_count and len(non_sticky) > keep_count else (
+            non_sticky if keep_count == 0 else []
+        )
+
+        for backup in to_delete:
+            backup_id = _field(backup, 'id', 'ID', 'Id')
+            backup_name = _field(backup, 'name', 'Name', default=backup_id)
+            backup_timestamp = _field(backup, 'timestamp', 'Timestamp', default='unknown')
+            if not backup_id:
+                logger.error('_prune_amp_backups: backup response is missing an id')
+                continue
+            try:
+                await instance.delete_local_backup(str(backup_id))
+                logger.info(
+                    '_prune_amp_backups: deleted old AMP backup %s (%s)',
+                    backup_name,
+                    backup_timestamp,
+                )
+            except Exception as e:
+                logger.error(f'_prune_amp_backups: failed deleting backup {backup_id}: {e}')
+                return False
+        return True
+
+    async def _prune_mirrored_backups(self, instance_name: str):
+        """Delete mirrored backup zips on both drives down to the
+        MAX_KEPT_BACKUPS newest per instance, oldest-first by mtime. Runs the
+        directory scan/delete in a thread since it's blocking file I/O."""
+        def _prune_dir(drive_root: str):
+            dest_dir = Path(drive_root) / instance_name
+            if not dest_dir.is_dir():
+                return
+            zips = sorted(
+                (p for p in dest_dir.glob('*.zip') if not p.name.endswith('.partial')),
+                key=lambda p: p.stat().st_mtime,
+            )
+            if len(zips) <= self.MAX_KEPT_BACKUPS:
+                return
+            for old in zips[:-self.MAX_KEPT_BACKUPS]:
+                try:
+                    old.unlink()
+                    logger.info(f'_prune_mirrored_backups: deleted {old} for {instance_name}')
+                except Exception as e:
+                    logger.error(f'_prune_mirrored_backups: failed deleting {old}: {e}')
+
+        for drive_root in ('/backup/primary2tb', '/backup/secondary4tb'):
+            await asyncio.get_event_loop().run_in_executor(None, _prune_dir, drive_root)
+
+    async def _restart_after_backup_cycle(
+        self,
+        cfg: dict,
+        instance,
+        wait_after_start: int,
+    ) -> bool:
+        """Restart a stopped server and publish its configured online notice.
+
+        Restarting is required whether backup verification succeeds or fails.
+        Keeping the online notification in the same recovery path prevents a
+        backup bookkeeping problem from leaving players with a stale down alert.
+        """
+        instance_name = cfg['instance_name']
+        try:
+            await instance.start_application()
+        except Exception as e:
+            logger.error(f'Warned backup cycle start {instance_name}: {e}')
+            return False
+
+        await asyncio.sleep(max(0, wait_after_start))
+
+        # Pick up any message/channel edits made while the cycle was running.
+        fresh = _load_all_configs()
+        current_cfg = next(
+            (item for item in fresh if item['instance_name'] == instance_name),
+            cfg,
+        )
+        await self._send_backup_notice(
+            current_cfg,
+            'online',
+            include_rcon=False,
+        )
+        logger.info(
+            'Warned backup cycle: %s restarted; online notice sent',
+            instance_name,
+        )
+        return True
+
+    async def _run_warned_backup_cycle(self, cfg: dict, backup_days: list = None):
+        """Full warn -> stop -> backup -> start -> confirm cycle for one instance.
+        Every timing value (warning lead times, wait durations) is admin-configurable
+        per instance via Quest Control's Schedule tab - nothing here is hardcoded.
+        The scheduler triggers this at (backup_hour:backup_minute - max(warning_minutes)),
+        so the LAST warning always lands exactly at the configured backup time."""
+        instance_name = cfg['instance_name']
+        display = cfg.get('server_display_name') or instance_name
+        day_name = datetime.datetime.now().strftime('%A')
+        if backup_days is not None and day_name not in backup_days:
+            logger.info(f'Warned backup cycle: skipping {instance_name} on {day_name} (not in backup_days)')
+            return
+
+        warning_minutes = _parse_backup_warning_minutes(cfg.get('backup_warning_minutes'))
+        wait_after_stop = int(cfg.get('backup_wait_after_stop_sec') or 300)
+        wait_after_start = int(cfg.get('backup_wait_after_start_sec') or 120)
+
+        logger.info(f'Warned backup cycle starting for {instance_name} (warnings={warning_minutes})')
+
+        # Absolute time the server actually goes down, for the {time} placeholder in
+        # admin-authored embed text - computed once so it stays consistent across every
+        # warning even as the cycle progresses.
+        backup_epoch = int(time.time()) + max(warning_minutes, default=0) * 60
+
+        # Warnings count down to 0 - the gap between consecutive entries (and from the
+        # last entry to 0) is how long we sleep after sending each one. e.g. [15,10,5]
+        # sleeps 5 minutes after each notice, landing the stop exactly at T-0.
+        checkpoints = warning_minutes + [0]
+        for i, minutes_left in enumerate(checkpoints):
+            if minutes_left > 0:
+                await self._send_backup_notice(cfg, 'warn', minutes_left=minutes_left, backup_epoch=backup_epoch)
+            else:
+                await self._send_backup_notice(cfg, 'down', backup_epoch=backup_epoch)
+                break
+            gap_minutes = minutes_left - checkpoints[i + 1]
+            await asyncio.sleep(max(0, gap_minutes) * 60)
+            # Re-check backups_enabled hasn't been turned off mid-warning-sequence.
+            fresh = _load_all_configs()
+            cfg = next((c for c in fresh if c['instance_name'] == instance_name), cfg)
+            if not cfg.get('backups_enabled'):
+                logger.info(f'Warned backup cycle: {instance_name} backups_enabled turned off, aborting')
+                return
+
+        instance = await _get_amp_instance(instance_name)
+        if not instance:
+            logger.error(f'Warned backup cycle: {instance_name} AMP instance not found, aborting')
+            return
+
+        try:
+            await instance.stop_application()
+        except Exception as e:
+            logger.error(f'Warned backup cycle stop {instance_name}: {e}')
+            return
+
+        await asyncio.sleep(wait_after_stop)
+
+        backup_ok = await self._take_backup_and_wait(
+            cfg,
+            instance,
+            f'Auto-{day_name}',
+            f'Scheduled nightly backup ({day_name})',
+        )
+
+        if not backup_ok:
+            # The instance is already stopped at this point. Restart it now
+            # rather than leaving it down after a failed backup. Players still
+            # need the online notice once that recovery restart has completed.
+            restarted = await self._restart_after_backup_cycle(
+                cfg,
+                instance,
+                wait_after_start,
+            )
+            logger.error(
+                'Warned backup cycle: backup verification failed for %s; '
+                'recovery restart=%s',
+                instance_name,
+                'complete' if restarted else 'failed',
+            )
+            return
+
+        try:
+            await self._mirror_latest_backup(cfg)
+        except Exception as e:
+            logger.error(f'Warned backup cycle mirror {instance_name}: {e}')
+
+        try:
+            await self._prune_amp_backups(instance)
+        except Exception as e:
+            logger.error(f'Warned backup cycle prune {instance_name}: {e}')
+
+        restarted = await self._restart_after_backup_cycle(
+            cfg,
+            instance,
+            wait_after_start,
+        )
+        if not restarted:
+            return
+        logger.info(f'Warned backup cycle complete for {instance_name}')
 
     # ---- Generic commands (work for any game) ----
 
     def _get_cfg_for_guild(self, guild_id: str) -> list[dict]:
         configs = _load_all_configs()
-        return [c for c in configs if str(c.get('guild_id')) == str(guild_id)]
+        return [c for c in configs if str(c.get('fluxer_guild_id')) == str(guild_id)]
 
     @Cog.command(name='gs_status')
     async def gs_status(self, ctx):
@@ -1183,12 +2404,15 @@ class GameServerCog(Cog):
             embed = fluxer.Embed(description='You do not have permission.', color=0xFF4444)
             await self.bot._http.send_message(str(ctx.channel.id), embeds=[embed])
             return
-        amp_inst = await _get_amp_instance(cfg['instance_name'])
-        if not amp_inst:
-            embed = fluxer.Embed(description='Could not connect to AMP.', color=0xFF4444)
+        ok, error = await _quest_control_server_action(
+            cfg['instance_name'],
+            guild_id,
+            'start',
+        )
+        if not ok:
+            embed = fluxer.Embed(description=error or 'Start failed.', color=0xFF4444)
             await self.bot._http.send_message(str(ctx.channel.id), embeds=[embed])
             return
-        await amp_inst.start_application()
         embed = fluxer.Embed(
             description=f'Start command sent to **{cfg.get("server_display_name") or cfg["instance_name"]}**.',
             color=0x00FF88,
@@ -1208,12 +2432,15 @@ class GameServerCog(Cog):
             embed = fluxer.Embed(description='You do not have permission.', color=0xFF4444)
             await self.bot._http.send_message(str(ctx.channel.id), embeds=[embed])
             return
-        amp_inst = await _get_amp_instance(cfg['instance_name'])
-        if not amp_inst:
-            embed = fluxer.Embed(description='Could not connect to AMP.', color=0xFF4444)
+        ok, error = await _quest_control_server_action(
+            cfg['instance_name'],
+            guild_id,
+            'stop',
+        )
+        if not ok:
+            embed = fluxer.Embed(description=error or 'Stop failed.', color=0xFF4444)
             await self.bot._http.send_message(str(ctx.channel.id), embeds=[embed])
             return
-        await amp_inst.stop_application()
         embed = fluxer.Embed(
             description=f'Stop command sent to **{cfg.get("server_display_name") or cfg["instance_name"]}**.',
             color=0xFF8C00,
@@ -1233,12 +2460,15 @@ class GameServerCog(Cog):
             embed = fluxer.Embed(description='You do not have permission.', color=0xFF4444)
             await self.bot._http.send_message(str(ctx.channel.id), embeds=[embed])
             return
-        amp_inst = await _get_amp_instance(cfg['instance_name'])
-        if not amp_inst:
-            embed = fluxer.Embed(description='Could not connect to AMP.', color=0xFF4444)
+        ok, error = await _quest_control_server_action(
+            cfg['instance_name'],
+            guild_id,
+            'restart',
+        )
+        if not ok:
+            embed = fluxer.Embed(description=error or 'Restart failed.', color=0xFF4444)
             await self.bot._http.send_message(str(ctx.channel.id), embeds=[embed])
             return
-        await amp_inst.restart_application()
         embed = fluxer.Embed(
             description=f'Restart command sent to **{cfg.get("server_display_name") or cfg["instance_name"]}**.',
             color=0x00BFFF,
@@ -1258,15 +2488,17 @@ class GameServerCog(Cog):
             embed = fluxer.Embed(description='You do not have permission.', color=0xFF4444)
             await self.bot._http.send_message(str(ctx.channel.id), embeds=[embed])
             return
-        amp_inst = await _get_amp_instance(cfg['instance_name'])
-        if not amp_inst:
-            embed = fluxer.Embed(description='Could not connect to AMP.', color=0xFF4444)
+        ok, error = await _quest_control_server_action(
+            cfg['instance_name'],
+            guild_id,
+            'backup',
+        )
+        if not ok:
+            embed = fluxer.Embed(description=error or 'Backup request failed.', color=0xFF4444)
             await self.bot._http.send_message(str(ctx.channel.id), embeds=[embed])
             return
-        label = f'Manual-{datetime.datetime.utcnow().strftime("%Y%m%d-%H%M")}'
-        await amp_inst.take_backup(label, f'Manual backup via !gs_backup', False)
         embed = fluxer.Embed(
-            description=f'Backup `{label}` started for **{cfg.get("server_display_name") or cfg["instance_name"]}**.',
+            description=f'Backup queued through Quest Control for **{cfg.get("server_display_name") or cfg["instance_name"]}**.',
             color=0x00FF88,
         )
         await self.bot._http.send_message(str(ctx.channel.id), embeds=[embed])

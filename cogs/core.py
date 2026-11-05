@@ -8,7 +8,8 @@ import asyncio
 import aiohttp
 import fluxer
 from fluxer import Cog
-from config import logger, QUESTLOG_INTERNAL_API_URL, QUESTLOG_BOT_SECRET
+from config import logger, QUESTLOG_INTERNAL_API_URL, QUESTLOG_BOT_SECRET, db_session_scope
+from sqlalchemy import text
 
 BRAND_COLOR = 0x5865F2
 GREEN_COLOR = 0x57F287
@@ -18,6 +19,58 @@ GOLD_COLOR = 0xFEE75C
 SYNC_COOLDOWN = 5          # seconds between event-triggered syncs per guild
 PERIODIC_SYNC_INTERVAL = 1800  # 30 minutes full re-sync of all guilds
 ACTION_POLL_INTERVAL = 15  # seconds between pending guild-action checks
+
+
+def _action_resources_belong_to_guild(
+    guild_id: str, *, channel_id: str = '', role_ids=(),
+) -> bool:
+    """Fail closed unless every dashboard-supplied resource belongs to guild."""
+    guild_id = str(guild_id or '').strip()
+    channel_id = str(channel_id or '').strip()
+    normalized_roles = {
+        str(role_id or '').strip() for role_id in role_ids
+        if str(role_id or '').strip()
+    }
+    if not guild_id or (channel_id and not channel_id.isdigit()) or any(
+        not role_id.isdigit() for role_id in normalized_roles
+    ):
+        return False
+    try:
+        with db_session_scope() as db:
+            if channel_id:
+                channel = db.execute(text(
+                    "SELECT 1 FROM web_fluxer_guild_channels "
+                    "WHERE guild_id = :guild_id AND channel_id = :channel_id "
+                    "LIMIT 1"
+                ), {
+                    'guild_id': guild_id,
+                    'channel_id': channel_id,
+                }).fetchone()
+                if not channel:
+                    return False
+            if normalized_roles:
+                placeholders = ','.join(
+                    f':role_{index}' for index, _ in enumerate(normalized_roles)
+                )
+                params = {'guild_id': guild_id}
+                params.update({
+                    f'role_{index}': role_id
+                    for index, role_id in enumerate(sorted(normalized_roles))
+                })
+                rows = db.execute(text(
+                    "SELECT role_id FROM web_fluxer_guild_roles "
+                    "WHERE guild_id = :guild_id "
+                    f"AND role_id IN ({placeholders})"
+                ), params).fetchall()
+                if {str(row[0]) for row in rows} != normalized_roles:
+                    return False
+        return True
+    except Exception as exc:
+        logger.warning(
+            "Could not verify dashboard action resources for guild %s: %s",
+            guild_id, type(exc).__name__,
+        )
+        return False
 
 
 class CoreCog(Cog):
@@ -52,6 +105,14 @@ class CoreCog(Cog):
     @Cog.listener()
     async def on_guild_join(self, guild):
         """New guild - full sync with joined_at set to now."""
+        # Fluxer replays GUILD_CREATE for every existing guild while the gateway
+        # is still becoming ready.  The normal on_ready sync runs after a
+        # five-second settling period, so an immediate duplicate sync here only
+        # races partially initialized upstream services and produces transient
+        # 502 warnings.  Real joins after startup still take this path.
+        if not self._bot_ready:
+            logger.debug("Deferring startup guild sync until gateway ready")
+            return
         # Fluxer SDK may pass a dict or a guild object
         guild_id = guild['id'] if isinstance(guild, dict) else guild.id
         guild_name = guild.get('name', 'unknown') if isinstance(guild, dict) else getattr(guild, 'name', 'unknown')
@@ -257,6 +318,10 @@ class CoreCog(Cog):
                     channel_id = str(payload.get('channel_id', '') or '')
                     if not channel_id:
                         raise ValueError("channel_id is required")
+                    if not _action_resources_belong_to_guild(
+                        guild_id, channel_id=channel_id,
+                    ):
+                        raise ValueError("channel is not available in this guild")
                     color_raw = payload.get('color', '#ea580c') or '#ea580c'
                     color_int = int(color_raw.lstrip('#'), 16) if color_raw.startswith('#') else 0xea580c
                     embed = fluxer.Embed(
@@ -266,7 +331,9 @@ class CoreCog(Cog):
                     )
                     if payload.get('footer'):
                         embed.set_footer(text=str(payload['footer'])[:256])
-                    await self.bot._http.send_message(channel_id, embed=embed)
+                    mention = payload.get('mention', '') or ''
+                    content = mention if mention in ('@here', '@everyone') else None
+                    await self.bot._http.send_message(channel_id, content=content, embed=embed)
                     async with aiohttp.ClientSession() as session:
                         await session.post(done_url, json={
                             'success': True,
@@ -341,6 +408,100 @@ class CoreCog(Cog):
                             'result': {'channels_created': channels_created},
                         }, headers=headers, timeout=aiohttp.ClientTimeout(total=5))
                     logger.info(f"apply_channel_template: created {len(channels_created)} items in guild {guild_id}")
+                elif action_type == 'deploy_reaction_role':
+                    rr_id           = int(payload.get('rr_id', 0) or 0)
+                    channel_id      = str(payload.get('channel_id', '') or '')
+                    title           = str(payload.get('title', '') or 'Reaction Roles')
+                    description     = str(payload.get('description', '') or '')
+                    roles           = payload.get('roles', []) or []
+                    mention_role_id = str(payload.get('mention_role_id', '') or '')
+                    old_message_id  = str(payload.get('old_message_id', '') or '')
+
+                    if not channel_id:
+                        raise ValueError("deploy_reaction_role: channel_id is required")
+                    if not roles:
+                        raise ValueError("deploy_reaction_role: at least one role is required")
+                    if not all(isinstance(role, dict) for role in roles):
+                        raise ValueError("deploy_reaction_role: invalid role list")
+                    selected_role_ids = {
+                        str(role.get('role_id', '') or '').strip()
+                        for role in roles
+                    }
+                    if not all(selected_role_ids) or not _action_resources_belong_to_guild(
+                        guild_id,
+                        channel_id=channel_id,
+                        role_ids=selected_role_ids | ({mention_role_id} if mention_role_id else set()),
+                    ):
+                        raise ValueError(
+                            "deploy_reaction_role: a selected resource is not available in this guild"
+                        )
+
+                    # Delete old message if redeploying (edit case)
+                    if old_message_id:
+                        try:
+                            await self.bot._http.delete_message(channel_id, old_message_id)
+                        except Exception as de:
+                            logger.warning(f"deploy_reaction_role: could not delete old message {old_message_id}: {de}")
+
+                    # Build embed
+                    lines = []
+                    for r in roles:
+                        emoji = r.get('emoji', '')
+                        role_name = r.get('role_name') or r.get('role_id', '')
+                        remove_label = 'Remove on unreact' if r.get('remove_on_unreact', True) else 'Keep on unreact'
+                        lines.append(f"{emoji} **{role_name}** - {remove_label}")
+                    embed_desc = (description + '\n\n' if description else '') + '\n'.join(lines)
+                    embed = fluxer.Embed(title=title, description=embed_desc, color=0xf59e0b)
+                    embed.set_footer(text='React below to assign yourself a role')
+
+                    # Build mention content - role mention goes as plain message content so it pings
+                    content = f'<@&{mention_role_id}>' if mention_role_id else None
+
+                    # Post message to channel
+                    resp = await self.bot._http.send_message(channel_id, content=content, embed=embed)
+                    message_id = str(resp.get('id', '') if isinstance(resp, dict) else '')
+                    if not message_id:
+                        raise ValueError("deploy_reaction_role: failed to get message_id from send_message response")
+
+                    # Add reactions to the posted message
+                    for r in roles:
+                        emoji = r.get('emoji', '')
+                        if emoji:
+                            try:
+                                await self.bot._http.add_reaction(channel_id, message_id, emoji)
+                            except Exception as re:
+                                logger.warning(f"deploy_reaction_role: add_reaction failed for {emoji}: {re}")
+
+                    # Write rows to fluxer_react_roles (bot's own table)
+                    with db_session_scope() as db:
+                        # Remove any prior rows for this message so redeploy is clean
+                        db.execute(
+                            text("DELETE FROM fluxer_react_roles WHERE guild_id = :g AND message_id = :m"),
+                            {'g': guild_id, 'm': message_id}
+                        )
+                        for r in roles:
+                            emoji = r.get('emoji', '')
+                            role_id = str(r.get('role_id', '') or '')
+                            role_name = str(r.get('role_name') or role_id)
+                            remove_on_unreact = 1 if r.get('remove_on_unreact', True) else 0
+                            if emoji and role_id:
+                                db.execute(text(
+                                    "INSERT INTO fluxer_react_roles "
+                                    "(guild_id, channel_id, message_id, emoji, role_id, role_name, remove_on_unreact, created_at) "
+                                    "VALUES (:g, :ch, :m, :e, :r, :rn, :rou, :ts)"
+                                ), {
+                                    'g': guild_id, 'ch': channel_id, 'm': message_id,
+                                    'e': emoji, 'r': role_id, 'rn': role_name,
+                                    'rou': remove_on_unreact,
+                                    'ts': int(time.time()),
+                                })
+
+                    async with aiohttp.ClientSession() as session:
+                        await session.post(done_url, json={
+                            'success': True,
+                            'result': {'message_id': message_id},
+                        }, headers=headers, timeout=aiohttp.ClientTimeout(total=5))
+                    logger.info(f"deploy_reaction_role: posted message {message_id} in channel {channel_id} for guild {guild_id}")
                 else:
                     logger.warning(f"Unknown action_type '{action_type}' for guild {guild_id}")
                     async with aiohttp.ClientSession() as session:
@@ -660,8 +821,12 @@ class CoreCog(Cog):
             value=(
                 "`!ping` - Check bot status\n"
                 "`!help` - This menu\n"
+                "`!commands` - All supported game and tool commands\n"
                 "`!info` - About QuestLog Bot\n"
-                "`!invite` - Get an invite link to this server"
+                "`!invite` - Get an invite link to this server\n"
+                "`!dd2 <name>` - Search the DD2 game database\n"
+                "`!dd2 commands` - List every DD2 command\n"
+                "`!dd2 locations [name]` - DD2 location guide and live map"
             ),
             inline=False,
         )

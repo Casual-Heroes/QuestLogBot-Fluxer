@@ -12,6 +12,11 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, scoped_session
 from sqlalchemy.pool import QueuePool
 
+# Preserve the service-specific Quest Control credential supplied by systemd.
+# warden.env is shared with Discord and is loaded below for the remaining
+# settings, but it must not replace Fluxer's dedicated credential.
+_quest_control_bot_secret_override = os.getenv("QUEST_CONTROL_BOT_SECRET")
+
 # Load secrets - same secrets file as wardenbot (shared DB)
 _secrets_path = Path("/etc/casual-heroes/warden.env")
 if _secrets_path.exists():
@@ -23,6 +28,9 @@ else:
 _game_secrets_path = Path("/etc/casual-heroes/secrets.env")
 if _game_secrets_path.exists():
     load_dotenv(_game_secrets_path, override=True)
+
+if _quest_control_bot_secret_override is not None:
+    os.environ["QUEST_CONTROL_BOT_SECRET"] = _quest_control_bot_secret_override
 
 # ====== Logging ======
 
@@ -57,7 +65,12 @@ IS_PRODUCTION = os.getenv("ENVIRONMENT", "development").lower() == "production"
 
 # QuestLog web platform internal API (for bot <-> web comms)
 QUESTLOG_INTERNAL_API_URL = os.getenv("QUESTLOG_INTERNAL_API_URL", "https://casual-heroes.com")
+QUESTLOG_PUBLIC_URL = os.getenv(
+    "QUESTLOG_PUBLIC_URL", "https://questlog.casual-heroes.com"
+).rstrip("/")
 QUESTLOG_BOT_SECRET = os.getenv("QUESTLOG_BOT_SECRET", "")
+QUEST_CONTROL_BOT_SECRET = os.getenv("QUEST_CONTROL_BOT_SECRET", "")
+QUESTLOG_LFG_API_TOKEN = os.getenv("QUESTLOG_LFG_API_TOKEN", "").strip()
 DISCORD_BOT_TOKEN = os.getenv("WARDEN_BOT_TOKEN", "")
 
 # IGDB (uses Twitch OAuth) - same creds as wardenbot

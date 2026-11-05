@@ -23,10 +23,67 @@ from sqlalchemy import text
 
 from config import logger, db_session_scope
 
-# Simple LRU message cache: {message_id: {author_id, author_name, content, channel_id, guild_id}}
-# Capped at 5000 entries to limit memory usage
+# Simple LRU message cache keyed by (guild_id, channel_id, message_id).
+# The compound key prevents a deletion event from resolving content cached for
+# another guild or channel. Capped at 5000 entries to limit memory usage.
 _MSG_CACHE = OrderedDict()
 _MSG_CACHE_MAX = 5000
+
+
+def _message_cache_key(guild_id, channel_id, message_id):
+    return str(guild_id), str(channel_id), str(message_id)
+
+
+def _safe_audit_fragment(value, limit):
+    value = ''.join(
+        char for char in str(value or '')
+        if char in {'\n', '\t'} or ord(char) >= 32
+    ).strip().replace('@', '@\u200b')
+    return value[:limit]
+
+
+def _safe_deleted_content(cached, limit=500):
+    """Render cached content safely for an audit embed without live mentions."""
+    content = _safe_audit_fragment((cached or {}).get('content'), limit)
+    extras = []
+    attachment_names = (cached or {}).get('attachments') or []
+    if attachment_names:
+        extras.append('Attachments: ' + ', '.join(
+            _safe_audit_fragment(name, 255) for name in attachment_names[:5]
+        ))
+    embed_count = int((cached or {}).get('embed_count') or 0)
+    if embed_count:
+        extras.append(f"{embed_count} embedded item{'s' if embed_count != 1 else ''}")
+    rendered = '\n'.join(part for part in (content, *extras) if part)
+    if not rendered:
+        return 'Unavailable (message was not cached before deletion)'
+    if len(rendered) > limit:
+        return rendered[:max(0, limit - 3)].rstrip() + '...'
+    return rendered
+
+
+def _deleted_message_line(cached, position, limit=300):
+    author_name = _safe_audit_fragment(
+        (cached or {}).get('author_name') or 'Unknown author', 128,
+    )
+    author_id = str((cached or {}).get('author_id') or '')
+    author = f"{author_name} (<@{author_id}>)" if author_id else author_name
+    return f"{position}. {author}: {_safe_deleted_content(cached, limit=limit)}"
+
+
+def _bulk_delete_details(channel_id, deleted_messages, total):
+    """Build a bounded audit summary while reporting cache misses honestly."""
+    lines = [f"{total} messages deleted in <#{channel_id}>"]
+    hidden = 0
+    for position, cached in enumerate(deleted_messages, 1):
+        line = _deleted_message_line(cached, position)
+        if len('\n'.join((*lines, line))) > 950:
+            hidden = len(deleted_messages) - position + 1
+            break
+        lines.append(line)
+    if hidden:
+        lines.append(f"...and {hidden} more deleted message{'s' if hidden != 1 else ''}.")
+    return '\n'.join(lines)[:1024]
 
 
 ACTION_CATEGORIES = {
@@ -384,10 +441,19 @@ class AuditCog(Cog):
             if not message.guild_id:
                 return
             msg_id = str(message.id)
-            _MSG_CACHE[msg_id] = {
+            cache_key = _message_cache_key(
+                message.guild_id, message.channel_id, msg_id,
+            )
+            _MSG_CACHE[cache_key] = {
                 'author_id':   str(message.author.id) if message.author else None,
                 'author_name': str(message.author) if message.author else None,
                 'content':     (message.content or '')[:500],
+                'attachments': [
+                    str(getattr(item, 'filename', '') or '')[:255]
+                    for item in (getattr(message, 'attachments', None) or [])[:5]
+                    if getattr(item, 'filename', None)
+                ],
+                'embed_count': min(10, len(getattr(message, 'embeds', None) or [])),
                 'channel_id':  str(message.channel_id),
                 'guild_id':    str(message.guild_id),
             }
@@ -396,6 +462,11 @@ class AuditCog(Cog):
                 _MSG_CACHE.popitem(last=False)
         except Exception:
             pass
+
+    @Cog.listener()
+    async def on_message_edit(self, message):
+        """Keep the cached snapshot aligned with the content that was deleted."""
+        await self.on_message(message)
 
     # -------------------------------------------------------------------------
     # Message events - raw dicts
@@ -425,38 +496,35 @@ class AuditCog(Cog):
             if not guild_id:
                 return
 
-            cached = _MSG_CACHE.pop(msg_id, None)
-            actor_id = None
-            actor_name = None
-            content_snippet = None
-
-            if cached:
-                actor_id = cached.get('author_id')
-                actor_name = cached.get('author_name')
-                content = cached.get('content', '')
-                if content:
-                    content_snippet = content[:200] + ('...' if len(content) > 200 else '')
+            cached = _MSG_CACHE.pop(
+                _message_cache_key(guild_id, channel_id, msg_id), None,
+            )
+            author_id = (cached or {}).get('author_id')
+            author_name = _safe_audit_fragment(
+                (cached or {}).get('author_name') or 'Unknown author', 128,
+            )
+            content_snippet = _safe_deleted_content(cached)
 
             with db_session_scope() as db:
                 enabled, log_channel, _ = _get_settings(db, guild_id)
                 if not enabled:
                     return
                 channel_name = self._resolve_channel_name(db, guild_id, channel_id)
-                # actor = message author (who we know performed or whose msg was deleted)
-                # target = the message content
-                # details = channel
-                target_name = f'"{content_snippet}"' if content_snippet else 'message'
                 _insert_log(db, guild_id, 'message_delete',
-                            actor_id=actor_id, actor_name=actor_name,
-                            target_name=target_name,
-                            target_type='message', details=channel_name)
+                            actor_name='Not provided by Fluxer',
+                            target_id=author_id, target_name=author_name,
+                            target_type='user',
+                            details=(f"{channel_name} · Message {msg_id} · "
+                                     f"{content_snippet}"))
 
             if log_channel:
                 await self._send_embed(
                     log_channel, 'message_delete',
-                    actor_id=actor_id, actor_name=actor_name,
-                    target_name=target_name, target_type='message',
-                    details=f"Channel: <#{channel_id}>\nContent: {content_snippet or '(unknown)'}",
+                    actor_name='Not provided by Fluxer',
+                    target_id=author_id, target_name=author_name,
+                    target_type='user',
+                    details=(f"Channel: <#{channel_id}>\nMessage ID: {msg_id}\n"
+                             f"Content: {content_snippet}"),
                 )
         except Exception as e:
             logger.error(f"AuditCog on_message_delete: {e}")
@@ -466,19 +534,54 @@ class AuditCog(Cog):
         try:
             guild_id = str(data.get('guild_id', ''))
             channel_id = str(data.get('channel_id', ''))
-            ids = data.get('ids', [])
-            if not guild_id:
+            raw_ids = data.get('ids', [])
+            ids = [str(value) for value in raw_ids[:100]] if isinstance(raw_ids, list) else []
+            if not guild_id or not ids:
                 return
-            # Remove cached messages
-            for mid in ids:
-                _MSG_CACHE.pop(str(mid), None)
+            deleted_messages = [
+                _MSG_CACHE.pop(
+                    _message_cache_key(guild_id, channel_id, mid), None,
+                )
+                for mid in ids
+            ]
+
+            # Fluxer may use the bulk event even for one message. Present it
+            # as a normal deletion with the same author/content detail.
+            if len(ids) == 1:
+                cached = deleted_messages[0]
+                author_id = (cached or {}).get('author_id')
+                author_name = _safe_audit_fragment(
+                    (cached or {}).get('author_name') or 'Unknown author', 128,
+                )
+                content = _safe_deleted_content(cached)
+                details = (f"Channel: <#{channel_id}>\nMessage ID: {ids[0]}\n"
+                           f"Content: {content}")
+                with db_session_scope() as db:
+                    enabled, log_channel, _ = _get_settings(db, guild_id)
+                    if not enabled:
+                        return
+                    _insert_log(
+                        db, guild_id, 'message_delete',
+                        actor_name='Not provided by Fluxer',
+                        target_id=author_id, target_name=author_name,
+                        target_type='user', details=details,
+                    )
+                if log_channel:
+                    await self._send_embed(
+                        log_channel, 'message_delete',
+                        actor_name='Not provided by Fluxer',
+                        target_id=author_id, target_name=author_name,
+                        target_type='user', details=details,
+                    )
+                return
 
             with db_session_scope() as db:
                 enabled, log_channel, _ = _get_settings(db, guild_id)
                 if not enabled:
                     return
-                channel_name = self._resolve_channel_name(db, guild_id, channel_id)
-                details = f"{len(ids)} messages deleted in {channel_name}"
+                details = _bulk_delete_details(
+                    channel_id, deleted_messages, len(ids),
+                )
                 _insert_log(db, guild_id, 'message_bulk_delete',
                             target_type='message', details=details)
 

@@ -24,10 +24,12 @@ from cogs.audit import AuditCog
 from cogs.gameserver import GameServerCog
 from cogs.nominations import NominationsCog
 from cogs.legacy import LegacyCog
-from cogs.sdtd import SDTDCog
-from cogs.soulmask import SoulmaskCog
 from cogs.vquest import VQuestCog
 from cogs.activity_tracker import ActivityTrackerCog
+from cogs.ffxiv_timers import FFXIVTimersCog
+from cogs.dd2 import DD2Cog
+from cogs.elden_ring import EldenRingCog
+from cogs.game_hubs import GameHubsCog
 
 intents = fluxer.Intents.default()
 
@@ -62,10 +64,12 @@ async def main():
     await bot.add_cog(GameServerCog(bot))
     await bot.add_cog(NominationsCog(bot))
     await bot.add_cog(LegacyCog(bot))
-    await bot.add_cog(SDTDCog(bot))
-    await bot.add_cog(SoulmaskCog(bot))
     await bot.add_cog(VQuestCog(bot))
     await bot.add_cog(ActivityTrackerCog(bot))
+    await bot.add_cog(FFXIVTimersCog(bot))
+    await bot.add_cog(DD2Cog(bot))
+    await bot.add_cog(EldenRingCog(bot))
+    await bot.add_cog(GameHubsCog(bot))
     logger.info("Starting QuestLog Fluxer Bot...")
     await bot.start(token)
 

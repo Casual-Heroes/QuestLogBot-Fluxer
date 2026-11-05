@@ -70,9 +70,10 @@ async def is_bot_manager(ctx, cfg: dict = None) -> bool:
     computed = _compute_permissions(member_data, roles_data, ctx.guild_id)
     if computed & (Permissions.ADMINISTRATOR | Permissions.MANAGE_MESSAGES):
         return True
-    # Check Bot Manager role from gamebot_configs
-    if cfg and cfg.get('admin_role_id'):
-        allowed = {r.strip() for r in str(cfg['admin_role_id']).split(',') if r.strip()}
+    # Check the admin-configured Manager role for this specific instance
+    # (Quest Control -> Channels & Roles -> Manager Access -> Fluxer Manager Role)
+    if cfg and cfg.get('fluxer_manager_role_id'):
+        allowed = {r.strip() for r in str(cfg['fluxer_manager_role_id']).split(',') if r.strip()}
         member_role_ids = {str(r) for r in member_data.get('roles', [])}
         if allowed & member_role_ids:
             return True

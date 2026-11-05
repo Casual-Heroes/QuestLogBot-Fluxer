@@ -78,7 +78,7 @@ DURATION_ENUM = {
 # -------------------------------------------------------------------------
 
 _VQUEST_SELECT = (
-    "SELECT guild_id, notif_channel_id, live_log_channel_id, "
+    "SELECT fluxer_guild_id AS guild_id, notif_channel_id, live_log_channel_id, "
     "server_update_channel_id, admin_role_id, "
     "instance_name AS amp_instance_name, "
     "server_display_name, server_password AS vrising_password, "
@@ -93,10 +93,13 @@ _VQUEST_SELECT = (
 
 
 def _load_guild_config(guild_id: str) -> dict | None:
+    """guild_id here is the Fluxer guild id (VQuestCog is Fluxer-only) - compared
+    against the fluxer_guild_id column, aliased back to 'guild_id' in the SELECT
+    above so every downstream cfg['guild_id'] read in this file keeps working."""
     try:
         with db_session_scope() as db:
             row = db.execute(
-                text(_VQUEST_SELECT + " AND guild_id = :g LIMIT 1"),
+                text(_VQUEST_SELECT + " AND fluxer_guild_id = :g LIMIT 1"),
                 {'g': guild_id},
             ).fetchone()
             return dict(row._mapping) if row else None
@@ -470,7 +473,7 @@ class VQuestCog(Cog):
                             if new_msg_id and new_msg_id != old_msg_id:
                                 with db_session_scope() as db:
                                     db.execute(
-                                        text("UPDATE gamebot_configs SET serverinfo_message_id = :mid WHERE guild_id = :g AND game_type = 'V Rising'"),
+                                        text("UPDATE gamebot_configs SET serverinfo_message_id = :mid WHERE fluxer_guild_id = :g AND game_type = 'V Rising'"),
                                         {'mid': str(new_msg_id), 'g': guild_id},
                                     )
                         except Exception as e:
@@ -643,7 +646,7 @@ class VQuestCog(Cog):
                 if new_msg_id:
                     with db_session_scope() as db:
                         db.execute(
-                            text("UPDATE gamebot_configs SET serverchannel_message_id = :mid WHERE guild_id = :g AND game_type = 'V Rising'"),
+                            text("UPDATE gamebot_configs SET serverchannel_message_id = :mid WHERE fluxer_guild_id = :g AND game_type = 'V Rising'"),
                             {'mid': str(new_msg_id), 'g': guild_id},
                         )
             except Exception as e:
@@ -685,7 +688,7 @@ class VQuestCog(Cog):
                     pass
             with db_session_scope() as db:
                 db.execute(
-                    text("UPDATE gamebot_configs SET serverchannel_message_id = :ch, serverinfo_message_id = :mid WHERE guild_id = :g AND game_type = 'V Rising'"),
+                    text("UPDATE gamebot_configs SET serverchannel_message_id = :ch, serverinfo_message_id = :mid WHERE fluxer_guild_id = :g AND game_type = 'V Rising'"),
                     {'ch': str(ctx.channel.id), 'mid': str(new_msg_id), 'g': guild_id},
                 )
 
@@ -819,7 +822,7 @@ class VQuestCog(Cog):
 
         with db_session_scope() as db:
             db.execute(
-                text("UPDATE gamebot_configs SET server_display_name = :n WHERE guild_id = :g AND game_type = 'V Rising'"),
+                text("UPDATE gamebot_configs SET server_display_name = :n WHERE fluxer_guild_id = :g AND game_type = 'V Rising'"),
                 {'n': name, 'g': guild_id},
             )
         await self.bot._http.send_message(str(ctx.channel.id), content=f"Server name updated to: **{name}**")
@@ -833,7 +836,7 @@ class VQuestCog(Cog):
 
         with db_session_scope() as db:
             db.execute(
-                text("UPDATE gamebot_configs SET server_display_name = NULL WHERE guild_id = :g AND game_type = 'V Rising'"),
+                text("UPDATE gamebot_configs SET server_display_name = NULL WHERE fluxer_guild_id = :g AND game_type = 'V Rising'"),
                 {'g': guild_id},
             )
         await self.bot._http.send_message(str(ctx.channel.id), content="Server name cleared.")
@@ -856,7 +859,7 @@ class VQuestCog(Cog):
 
         with db_session_scope() as db:
             db.execute(
-                text("UPDATE gamebot_configs SET server_password = :p, show_password = 1 WHERE guild_id = :g AND game_type = 'V Rising'"),
+                text("UPDATE gamebot_configs SET server_password = :p, show_password = 1 WHERE fluxer_guild_id = :g AND game_type = 'V Rising'"),
                 {'p': password, 'g': guild_id},
             )
         await self.bot._http.send_message(str(ctx.channel.id), content="Server password updated.")
@@ -870,7 +873,7 @@ class VQuestCog(Cog):
 
         with db_session_scope() as db:
             db.execute(
-                text("UPDATE gamebot_configs SET server_password = NULL, show_password = 0 WHERE guild_id = :g AND game_type = 'V Rising'"),
+                text("UPDATE gamebot_configs SET server_password = NULL, show_password = 0 WHERE fluxer_guild_id = :g AND game_type = 'V Rising'"),
                 {'g': guild_id},
             )
         await self.bot._http.send_message(str(ctx.channel.id), content="Server password cleared.")

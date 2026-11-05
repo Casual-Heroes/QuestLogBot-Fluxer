@@ -14,20 +14,68 @@
 # !setup status         - Show current bot config
 
 import asyncio
+import hashlib
 import json
 import re
 import time
+from urllib.parse import urlparse
 import aiohttp
 import fluxer
 from fluxer import Cog
 from sqlalchemy import text
-from config import logger, db_session_scope, IGDB_CLIENT_ID, IGDB_CLIENT_SECRET
+from config import (
+    logger,
+    db_session_scope,
+    IGDB_CLIENT_ID,
+    IGDB_CLIENT_SECRET,
+    QUESTLOG_LFG_API_TOKEN,
+)
 
 POLL_INTERVAL = 5      # seconds between broadcast polls
+STAFF_BOARD_REFRESH_INTERVAL = 60
+STAFF_BOARD_CONFIG_KEY = "community_staff_board_v1"
+STAFF_BOARD_MESSAGE_KEY = "community_staff_board"
+# Fluxer's current public message request schema does not accept components.
+# Keep this fail-closed until that contract is published and verified; the
+# same cards retain their validated clickable embed fields in the meantime.
+FLUXER_MESSAGE_COMPONENTS_ENABLED = False
+LINK_BUTTON_SPECS = {
+    "steam": ("Steam", "store.steampowered.com", re.compile(r"^/app/[1-9][0-9]*/?$")),
+    "play_together": (
+        "Play Together",
+        "questlog.casual-heroes.com",
+        re.compile(r"^/play-together/request/[1-9][0-9]*/?$"),
+    ),
+    "questlog": (
+        "QuestLog",
+        "questlog.casual-heroes.com",
+        re.compile(r"^(?:/|/u/[^/]+/?)$"),
+    ),
+}
+LINK_FIELD_KINDS = {
+    "Steam": "steam",
+    "Play Together": "play_together",
+    "QuestLog": "questlog",
+}
 
 # Per-user command cooldowns: {"cmd:user_id" -> last_use_ts}
 _lfg_cmd_cooldowns: dict[str, float] = {}
 _LFG_CMD_COOLDOWN = 10.0  # seconds
+
+
+def _broadcast_destination_belongs_to_guild(db, guild_id, channel_id):
+    """Fail closed unless a queued Fluxer channel is cached for its guild."""
+    guild_id = str(guild_id or '').strip()
+    channel_id = str(channel_id or '').strip()
+    if not guild_id.isdigit() or not channel_id.isdigit():
+        return False
+    return db.execute(
+        text(
+            "SELECT 1 FROM web_fluxer_guild_channels "
+            "WHERE guild_id=:guild_id AND channel_id=:channel_id LIMIT 1"
+        ),
+        {'guild_id': guild_id, 'channel_id': channel_id},
+    ).fetchone() is not None
 
 
 def _lfg_cooldown(cmd: str, user_id: str) -> bool:
@@ -38,6 +86,40 @@ def _lfg_cooldown(cmd: str, user_id: str) -> bool:
         return True
     _lfg_cmd_cooldowns[key] = now
     return False
+
+
+def _future_fluxer_link_components(embed_data: dict) -> list[dict]:
+    """Build the disabled Fluxer link-button payload from allowlisted URLs."""
+    buttons = []
+    seen = set()
+    for item in embed_data.get("buttons") or []:
+        if not isinstance(item, dict):
+            continue
+        kind = str(item.get("kind") or "")
+        url = str(item.get("url") or "").strip()
+        spec = LINK_BUTTON_SPECS.get(kind)
+        if not spec or kind in seen or len(url) > 2048:
+            continue
+        label, expected_host, path_pattern = spec
+        try:
+            parsed = urlparse(url)
+            port = parsed.port
+        except (TypeError, ValueError):
+            continue
+        if (
+            parsed.scheme.lower() != "https"
+            or (parsed.hostname or "").lower() != expected_host
+            or parsed.username is not None
+            or parsed.password is not None
+            or port not in (None, 443)
+            or not path_pattern.fullmatch(parsed.path)
+        ):
+            continue
+        seen.add(kind)
+        buttons.append({"type": 2, "style": 5, "label": label, "url": url})
+        if len(buttons) == 3:
+            break
+    return [{"type": 1, "components": buttons}] if buttons else []
 
 GOLD_COLOR   = 0xFEE75C
 GREEN_COLOR  = 0x57F287
@@ -147,13 +229,19 @@ def _get_web_user_by_fluxer_id(fluxer_user_id: str):
     return None, None
 
 
-def _delete_web_lfg_group(group_id: int, web_user_id: int, force: bool = False) -> tuple[bool, str]:
+def _delete_web_lfg_group(
+    group_id: int, web_user_id: int, guild_id: str, force: bool = False,
+) -> tuple[bool, str]:
     """Mark an LFG group as cancelled. Returns (success, error_msg)."""
     try:
         with db_session_scope() as db:
             row = db.execute(
-                text("SELECT creator_web_user_id, status FROM web_fluxer_lfg_groups WHERE id = :id"),
-                {"id": group_id},
+                text(
+                    "SELECT creator_web_user_id, status "
+                    "FROM web_fluxer_lfg_groups "
+                    "WHERE id = :id AND guild_id = :guild_id"
+                ),
+                {"id": group_id, "guild_id": str(guild_id)},
             ).fetchone()
             if not row:
                 return False, "No group found with that ID."
@@ -162,8 +250,11 @@ def _delete_web_lfg_group(group_id: int, web_user_id: int, force: bool = False) 
             if not force and row.creator_web_user_id != web_user_id:
                 return False, "You can only delete your own LFG groups."
             db.execute(
-                text("UPDATE web_fluxer_lfg_groups SET status = 'cancelled' WHERE id = :id"),
-                {"id": group_id},
+                text(
+                    "UPDATE web_fluxer_lfg_groups SET status = 'cancelled' "
+                    "WHERE id = :id AND guild_id = :guild_id"
+                ),
+                {"id": group_id, "guild_id": str(guild_id)},
             )
             db.commit()
             return True, ""
@@ -243,6 +334,7 @@ class LfgCog(Cog):
     def __init__(self, bot):
         super().__init__(bot)
         self._broadcast_task: asyncio.Task | None = None
+        self._last_staff_board_refresh = 0.0
 
     # -----------------------------------------------------------------------
     # Background: poll fluxer_pending_broadcasts
@@ -313,12 +405,29 @@ class LfgCog(Cog):
         while True:
             try:
                 await self._dispatch_pending_broadcasts()
+                now = time.monotonic()
+                if (
+                    now - self._last_staff_board_refresh
+                    >= STAFF_BOARD_REFRESH_INTERVAL
+                ):
+                    self._last_staff_board_refresh = now
+                    await self._refresh_staff_board()
             except Exception as e:
                 logger.error(f"Broadcast poll loop error: {e}", exc_info=True)
             await asyncio.sleep(POLL_INTERVAL)
 
     def _build_embed(self, embed_data: dict) -> fluxer.Embed:
         """Build a fluxer.Embed from a payload dict."""
+        button_kinds = set()
+        if FLUXER_MESSAGE_COMPONENTS_ENABLED:
+            rows = _future_fluxer_link_components(embed_data)
+            button_kinds = {
+                kind for kind in LINK_BUTTON_SPECS
+                if any(
+                    component.get("label") == LINK_BUTTON_SPECS[kind][0]
+                    for row in rows for component in row.get("components", [])
+                )
+            }
         embed = fluxer.Embed(
             title=embed_data.get("title", ""),
             description=embed_data.get("description", ""),
@@ -326,6 +435,8 @@ class LfgCog(Cog):
             url=embed_data.get("url") or None,
         )
         for field in embed_data.get("fields", []):
+            if LINK_FIELD_KINDS.get(field.get("name")) in button_kinds:
+                continue
             embed.add_field(
                 name=field["name"],
                 value=field["value"],
@@ -336,6 +447,222 @@ class LfgCog(Cog):
         if embed_data.get("footer"):
             embed.set_footer(text=embed_data["footer"])
         return embed
+
+    async def _send_tracked_embed(self, channel_id, embed, embed_data):
+        components = _future_fluxer_link_components(embed_data)
+        if FLUXER_MESSAGE_COMPONENTS_ENABLED and components:
+            route = self.bot._http._route(
+                "POST", "/channels/{channel_id}/messages", channel_id=channel_id,
+            )
+            return await self.bot._http.request(route, json={
+                "embeds": [embed.to_dict()],
+                "components": components,
+            })
+        return await self.bot._http.send_message(str(channel_id), embed=embed)
+
+    async def _edit_tracked_embed(self, channel_id, message_id, embed, embed_data):
+        components = _future_fluxer_link_components(embed_data)
+        if FLUXER_MESSAGE_COMPONENTS_ENABLED and components:
+            route = self.bot._http._route(
+                "PATCH",
+                "/channels/{channel_id}/messages/{message_id}",
+                channel_id=channel_id,
+                message_id=message_id,
+            )
+            return await self.bot._http.request(route, json={
+                "embeds": [embed.to_dict()],
+                "components": components,
+            })
+        return await self.bot._http.edit_message(
+            str(channel_id), str(message_id), embeds=[embed.to_dict()],
+        )
+
+    @staticmethod
+    def _tracked_message_state_key(guild_id, message_key):
+        if message_key == STAFF_BOARD_MESSAGE_KEY:
+            return f"{STAFF_BOARD_MESSAGE_KEY}_fluxer_{guild_id}"
+        digest = hashlib.sha256(str(message_key).encode("utf-8")).hexdigest()[:32]
+        return f"tracked_message_fluxer_{guild_id}_{digest}"
+
+    @staticmethod
+    def _tracked_message_key(embed_data):
+        message_key = str(embed_data.get("message_key") or "")
+        if not message_key or len(message_key) > 160 or any(
+            not (char.isalnum() or char in ":_-") for char in message_key
+        ):
+            raise ValueError("Invalid tracked message key")
+        return message_key
+
+    @staticmethod
+    def _embed_signature(embed_data):
+        visual = {
+            key: embed_data.get(key)
+            for key in (
+                "title", "description", "url", "color", "fields",
+                "thumbnail", "footer", "buttons",
+            )
+        }
+        return json.dumps(visual, sort_keys=True, separators=(",", ":"))
+
+    def _load_tracked_message_state(self, guild_id, message_key):
+        try:
+            with db_session_scope() as db:
+                row = db.execute(
+                    text("SELECT value FROM web_site_config WHERE `key` = :key LIMIT 1"),
+                    {"key": self._tracked_message_state_key(guild_id, message_key)},
+                ).fetchone()
+            return json.loads(row[0]) if row and row[0] else {}
+        except Exception as error:
+            logger.warning(
+                f"Could not load Fluxer tracked message state for guild "
+                f"{guild_id}: {error}"
+            )
+            return {}
+
+    def _save_tracked_message_state(
+        self, guild_id, channel_id, message_id, signature, message_key
+    ):
+        state = json.dumps({
+            "channel_id": str(channel_id),
+            "message_id": str(message_id),
+            "signature": signature,
+        }, separators=(",", ":"))
+        now = int(time.time())
+        with db_session_scope() as db:
+            db.execute(
+                text(
+                    "INSERT INTO web_site_config (`key`, value, updated_at) "
+                    "VALUES (:key, :value, :updated_at) "
+                    "ON DUPLICATE KEY UPDATE "
+                    "value = :value, updated_at = :updated_at"
+                ),
+                {
+                    "key": self._tracked_message_state_key(guild_id, message_key),
+                    "value": state,
+                    "updated_at": now,
+                },
+            )
+
+    async def _upsert_staff_board(self, guild_id, channel_id, embed_data):
+        """Create one keyed Fluxer embed, then edit it when content changes."""
+        message_key = self._tracked_message_key(embed_data)
+        signature = self._embed_signature(embed_data)
+        state = self._load_tracked_message_state(guild_id, message_key)
+        message_id = None
+        if str(state.get("channel_id")) == str(channel_id):
+            message_id = state.get("message_id")
+
+        embed = self._build_embed(embed_data)
+        if message_id and state.get("signature") != signature:
+            try:
+                await self._edit_tracked_embed(
+                    str(channel_id), str(message_id), embed, embed_data,
+                )
+                logger.info(
+                    f"Updated Fluxer tracked message {message_key} in channel {channel_id}"
+                )
+            except Exception as error:
+                logger.warning(
+                    f"Could not edit Fluxer tracked message {message_id}: {error}. "
+                    f"A replacement will be posted."
+                )
+                message_id = None
+
+        if not message_id:
+            response = await self._send_tracked_embed(
+                str(channel_id), embed, embed_data,
+            )
+            message_id = (
+                str(response.get("id"))
+                if response and response.get("id") else None
+            )
+            logger.info(
+                f"Created Fluxer tracked message {message_key} in channel {channel_id}"
+            )
+
+        if message_id:
+            self._save_tracked_message_state(
+                guild_id, channel_id, message_id, signature, message_key
+            )
+
+    async def _refresh_staff_board(self):
+        """Resolve selected Fluxer roles and refresh the board when changed."""
+        try:
+            with db_session_scope() as db:
+                row = db.execute(
+                    text("SELECT value FROM web_site_config WHERE `key` = :key LIMIT 1"),
+                    {"key": STAFF_BOARD_CONFIG_KEY},
+                ).fetchone()
+            config = json.loads(row[0]) if row and row[0] else {}
+            target = config.get("fluxer", {})
+            if not target.get("enabled"):
+                return
+
+            guild_id = str(target.get("guild_id") or "")
+            channel_id = str(target.get("channel_id") or "")
+            selected_roles = target.get("roles", [])
+            if not guild_id or not channel_id or not selected_roles:
+                return
+
+            members_data = await self.bot._http.get_guild_members(
+                guild_id, limit=1000
+            )
+            role_members = {
+                str(role.get("id")): [] for role in selected_roles
+                if role.get("id")
+            }
+            for member in members_data or []:
+                user = member.get("user", member) or {}
+                if member.get("bot") or user.get("bot"):
+                    continue
+                user_id = str(user.get("id") or "")
+                if not user_id:
+                    continue
+                for role_id in member.get("roles", []) or []:
+                    role_id = str(role_id)
+                    if role_id in role_members:
+                        role_members[role_id].append(user_id)
+
+            fields = []
+            for selected in selected_roles:
+                role_id = str(selected.get("id") or "")
+                if not role_id:
+                    continue
+                members = role_members.get(role_id, [])
+                value = (
+                    "\n".join(f"• <@{member_id}>" for member_id in members)
+                    if members else "No members currently assigned."
+                )
+                fields.append({
+                    "name": (
+                        f"{selected.get('emoji', '🛡️')} "
+                        f"{selected.get('name', 'Leadership')}"
+                    ),
+                    "value": value,
+                    "inline": False,
+                })
+
+            if not fields:
+                return
+            embed_data = {
+                "action": "upsert_direct",
+                "message_key": STAFF_BOARD_MESSAGE_KEY,
+                "title": config.get("title", "Meet the Team"),
+                "description": config.get("description", ""),
+                "color": int(
+                    str(config.get("color", "#5865F2")).lstrip("#"), 16
+                ),
+                "fields": fields,
+                "footer": config.get("footer", "QuestLog"),
+            }
+            await self._upsert_staff_board(
+                guild_id, channel_id, embed_data
+            )
+        except Exception as error:
+            logger.error(
+                f"Fluxer staff board refresh failed: {error}",
+                exc_info=True,
+            )
 
     async def _pin_message(self, channel_id: str, message_id: str):
         """Pin a message via raw API call."""
@@ -359,6 +686,138 @@ class LfgCog(Cog):
         except Exception as e:
             logger.warning(f"Failed to unpin message {message_id} in channel {channel_id}: {e}")
 
+    @staticmethod
+    def _delivery_receipt(db, delivery_job_id):
+        if not delivery_job_id:
+            return None
+        return db.execute(
+            text(
+                "SELECT status,message_id,error_code,error_message "
+                "FROM lfg_delivery_receipts WHERE delivery_job_id=:job LIMIT 1"
+            ),
+            {"job": str(delivery_job_id)},
+        ).fetchone()
+
+    @staticmethod
+    def _save_delivery_receipt(
+        db,
+        delivery_job_id,
+        embed_data,
+        guild_id,
+        channel_id,
+        *,
+        status="delivered",
+        message_id=None,
+        error_code=None,
+        error_message=None,
+    ):
+        now = int(time.time())
+        canonical_group_id = embed_data.get("canonical_group_id") or embed_data.get(
+            "track_group_id"
+        )
+        db.execute(
+            text(
+                "INSERT INTO lfg_delivery_receipts "
+                "(delivery_job_id,canonical_group_id,action,status,guild_id,channel_id,"
+                "message_id,callback_url,error_code,error_message,created_at,updated_at) "
+                "VALUES (:job,:group_id,:action,:status,:guild,:channel,:message_id,"
+                ":callback,:error_code,:error_message,:now,:now) "
+                "ON DUPLICATE KEY UPDATE status=:status,message_id=COALESCE(:message_id,message_id),"
+                "callback_url=:callback,error_code=:error_code,error_message=:error_message,"
+                "updated_at=:now"
+            ),
+            {
+                "job": str(delivery_job_id),
+                "group_id": int(canonical_group_id) if canonical_group_id else None,
+                "action": embed_data.get("action", "post"),
+                "status": status,
+                "guild": int(guild_id) if guild_id else None,
+                "channel": int(channel_id) if channel_id else None,
+                "message_id": int(message_id) if message_id else None,
+                "callback": embed_data.get("delivery_callback_url"),
+                "error_code": error_code,
+                "error_message": error_message,
+                "now": now,
+            },
+        )
+        # Persist the platform result before the network callback. If the bot
+        # restarts or the callback fails, the next poll retries only the ack.
+        db.commit()
+
+    async def _acknowledge_delivery(
+        self,
+        delivery_job_id,
+        callback_url,
+        *,
+        status,
+        guild_id,
+        channel_id,
+        message_id=None,
+        error_message=None,
+    ):
+        if not callback_url or not QUESTLOG_LFG_API_TOKEN:
+            logger.error(
+                "Cannot acknowledge Fluxer LFG delivery %s: callback or API token missing",
+                delivery_job_id,
+            )
+            return False
+        callback = urlparse(str(callback_url))
+        if callback.scheme != "https" or callback.netloc != "questlog.casual-heroes.com":
+            logger.error(
+                "Cannot acknowledge Fluxer LFG delivery %s: invalid callback host",
+                delivery_job_id,
+            )
+            return False
+        details = {
+            "platform": "fluxer",
+            "guild_id": str(guild_id),
+            "channel_id": str(channel_id),
+        }
+        if message_id:
+            details["message_id"] = str(message_id)
+        payload = {"status": status, "details": details}
+        if error_message:
+            payload["message"] = str(error_message)[:500]
+        headers = {
+            "Authorization": f"Bearer {QUESTLOG_LFG_API_TOKEN}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "Idempotency-Key": f"fluxer:delivery:{delivery_job_id}:{status}",
+        }
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    str(callback_url),
+                    json=payload,
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=15),
+                ) as response:
+                    body = await response.json(content_type=None)
+                    if 200 <= response.status < 300:
+                        logger.info(
+                            "Fluxer LFG delivery %s acknowledged as %s",
+                            delivery_job_id,
+                            status,
+                        )
+                        return True
+                    code = (body.get("error") or {}).get("code") if isinstance(body, dict) else None
+                    # A repeated delivered acknowledgement is terminal and safe.
+                    if response.status == 409 and code == "delivery_already_completed" and status == "delivered":
+                        return True
+                    logger.error(
+                        "Fluxer LFG delivery callback failed for %s: %s (%s)",
+                        delivery_job_id,
+                        code or response.status,
+                        response.status,
+                    )
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as error:
+            logger.error(
+                "Fluxer LFG delivery callback failed for %s: %s",
+                delivery_job_id,
+                error,
+            )
+        return False
+
     async def _dispatch_pending_broadcasts(self):
         try:
             with db_session_scope() as db:
@@ -377,14 +836,193 @@ class LfgCog(Cog):
                 dispatched_ids = []
 
                 for row_id, guild_id, channel_id, payload_json in rows:
+                    delivery_job_id = None
+                    callback_url = None
                     try:
                         embed_data = json.loads(payload_json)
                         action = embed_data.get("action", "post")
                         track_group_id = embed_data.get("track_group_id")
                         track_group_platform = embed_data.get("track_group_platform", "web")
+                        track_post_id = embed_data.get("track_post_id")
+                        delivery_job_id = embed_data.get("delivery_job_id")
+                        callback_url = embed_data.get("delivery_callback_url")
 
+                        if action != "dm_user" and not (
+                            _broadcast_destination_belongs_to_guild(
+                                db, guild_id, channel_id,
+                            )
+                        ):
+                            raise PermissionError(
+                                "queued channel does not belong to queued guild"
+                            )
+
+                        # A platform operation may have succeeded before its
+                        # QuestLog callback did. Retry only the callback for a
+                        # terminal receipt so the Fluxer message is never
+                        # posted twice for the same delivery_job_id.
+                        receipt = self._delivery_receipt(db, delivery_job_id)
+                        if delivery_job_id and receipt and receipt[0] == "delivered":
+                            acknowledged = await self._acknowledge_delivery(
+                                delivery_job_id,
+                                callback_url,
+                                status="delivered",
+                                guild_id=guild_id,
+                                channel_id=channel_id,
+                                message_id=receipt[1],
+                            )
+                            if acknowledged:
+                                dispatched_ids.append(row_id)
+                            continue
+
+                        if action == "dm_user":
+                            target_user_id = str(embed_data.get("target_user_id") or "")
+                            if not target_user_id.isdigit() or len(target_user_id) > 25:
+                                raise ValueError("invalid Fluxer user ID in QuestLog DM payload")
+                            authorized = db.execute(
+                                text(
+                                    "SELECT 1 FROM web_users "
+                                    "WHERE fluxer_id=:user_id "
+                                    "AND notify_play_together_fluxer=1 "
+                                    "AND is_banned=0 AND is_disabled=0 LIMIT 1"
+                                ),
+                                {"user_id": target_user_id},
+                            ).fetchone()
+                            if not authorized:
+                                raise PermissionError(
+                                    "linked Fluxer user did not authorize Play Together DMs"
+                                )
+                            target_user = await self.bot.fetch_user(target_user_id)
+                            await target_user.send(embed=self._build_embed(embed_data))
+                            dispatched_ids.append(row_id)
+                            continue
+
+                        if action == "upsert_direct":
+                            await self._upsert_staff_board(
+                                str(guild_id),
+                                str(channel_id),
+                                embed_data,
+                            )
+                            dispatched_ids.append(row_id)
+                            continue
+
+                        # --- Post broadcast: edit in-place ---
+                        if action == "edit" and track_post_id:
+                            existing = db.execute(
+                                text(
+                                    "SELECT message_id, channel_id FROM web_post_broadcast_messages "
+                                    "WHERE post_id=:pid AND platform='fluxer' LIMIT 1"
+                                ),
+                                {"pid": int(track_post_id)},
+                            ).fetchone()
+                            if existing:
+                                stored_msg_id, stored_ch_id = existing
+                                if not _broadcast_destination_belongs_to_guild(
+                                    db, guild_id, stored_ch_id,
+                                ):
+                                    raise PermissionError(
+                                        "stored channel does not belong to queued guild"
+                                    )
+                                embed = self._build_embed(embed_data)
+                                try:
+                                    await self.bot._http.edit_message(
+                                        str(stored_ch_id), str(stored_msg_id),
+                                        embeds=[embed.to_dict()],
+                                    )
+                                except Exception as edit_err:
+                                    logger.warning(f"Failed to edit post message {stored_msg_id}: {edit_err}")
+                            else:
+                                # No tracked message yet - send as new
+                                embed = self._build_embed(embed_data)
+                                resp = await self.bot._http.send_message(str(channel_id), embed=embed)
+                                new_message_id = str(resp.get("id")) if resp and resp.get("id") else None
+                                if new_message_id:
+                                    db.execute(text("""
+                                        INSERT INTO web_post_broadcast_messages
+                                            (post_id, platform, channel_id, message_id, created_at)
+                                        VALUES (:pid, 'fluxer', :ch, :mid, :ts)
+                                        ON DUPLICATE KEY UPDATE message_id=:mid
+                                    """), {"pid": int(track_post_id), "ch": str(channel_id), "mid": new_message_id, "ts": now})
+                            dispatched_ids.append(row_id)
+                            continue
+
+                        # --- Post broadcast: delete ---
+                        if action == "delete" and track_post_id:
+                            existing = db.execute(
+                                text(
+                                    "SELECT message_id, channel_id FROM web_post_broadcast_messages "
+                                    "WHERE post_id=:pid AND platform='fluxer' LIMIT 1"
+                                ),
+                                {"pid": int(track_post_id)},
+                            ).fetchone()
+                            if existing:
+                                stored_msg_id, stored_ch_id = existing
+                                if not _broadcast_destination_belongs_to_guild(
+                                    db, guild_id, stored_ch_id,
+                                ):
+                                    raise PermissionError(
+                                        "stored channel does not belong to queued guild"
+                                    )
+                                try:
+                                    await self.bot._http.delete_message(str(stored_ch_id), str(stored_msg_id))
+                                except Exception as del_err:
+                                    logger.warning(f"Failed to delete post message {stored_msg_id}: {del_err}")
+                                db.execute(text(
+                                    "DELETE FROM web_post_broadcast_messages WHERE post_id=:pid AND platform='fluxer'"
+                                ), {"pid": int(track_post_id)})
+                            dispatched_ids.append(row_id)
+                            continue
+
+                        # --- LFG: delete the existing pinned message ---
+                        if action == "delete" and track_group_id:
+                            existing = db.execute(
+                                text(
+                                    "SELECT message_id, channel_id FROM web_lfg_channel_messages "
+                                    "WHERE group_id=:gid AND group_platform=:gp AND platform='fluxer' AND guild_id=:guild "
+                                    "LIMIT 1"
+                                ),
+                                {"gid": int(track_group_id), "gp": track_group_platform, "guild": str(guild_id)},
+                            ).fetchone()
+                            deleted_message_id = None
+                            if existing:
+                                deleted_message_id, stored_ch_id = existing
+                                if not _broadcast_destination_belongs_to_guild(
+                                    db, guild_id, stored_ch_id,
+                                ):
+                                    raise PermissionError(
+                                        "stored channel does not belong to queued guild"
+                                    )
+                                await self._unpin_message(str(stored_ch_id), str(deleted_message_id))
+                                await self.bot._http.delete_message(
+                                    str(stored_ch_id), str(deleted_message_id)
+                                )
+                                db.execute(
+                                    text(
+                                        "DELETE FROM web_lfg_channel_messages "
+                                        "WHERE group_id=:gid AND group_platform=:gp "
+                                        "AND platform='fluxer' AND guild_id=:guild"
+                                    ),
+                                    {"gid": int(track_group_id), "gp": track_group_platform, "guild": str(guild_id)},
+                                )
+                            if delivery_job_id:
+                                self._save_delivery_receipt(
+                                    db, delivery_job_id, embed_data, guild_id, channel_id,
+                                    message_id=deleted_message_id,
+                                )
+                                if await self._acknowledge_delivery(
+                                    delivery_job_id,
+                                    callback_url,
+                                    status="delivered",
+                                    guild_id=guild_id,
+                                    channel_id=channel_id,
+                                    message_id=deleted_message_id,
+                                ):
+                                    dispatched_ids.append(row_id)
+                            else:
+                                dispatched_ids.append(row_id)
+                            continue
+
+                        # --- LFG: edit existing pinned message in-place ---
                         if action == "edit" and track_group_id:
-                            # Edit the existing pinned message in-place
                             existing = db.execute(
                                 text(
                                     "SELECT message_id, channel_id FROM web_lfg_channel_messages "
@@ -395,24 +1033,43 @@ class LfgCog(Cog):
                             ).fetchone()
                             if existing:
                                 stored_msg_id, stored_ch_id = existing
-                                embed = self._build_embed(embed_data)
-                                try:
-                                    await self.bot._http.edit_message(
-                                        str(stored_ch_id), str(stored_msg_id),
-                                        embeds=[embed.to_dict()],
+                                if not _broadcast_destination_belongs_to_guild(
+                                    db, guild_id, stored_ch_id,
+                                ):
+                                    raise PermissionError(
+                                        "stored channel does not belong to queued guild"
                                     )
-                                    # Re-pin if group reopened (action carries pin_state)
-                                    pin_state = embed_data.get("pin_state")  # "pin" or "unpin"
-                                    if pin_state == "unpin":
-                                        await self._unpin_message(str(stored_ch_id), str(stored_msg_id))
-                                    elif pin_state == "pin":
-                                        await self._pin_message(str(stored_ch_id), str(stored_msg_id))
-                                except Exception as edit_err:
-                                    logger.warning(f"Failed to edit message {stored_msg_id}: {edit_err}")
-                            dispatched_ids.append(row_id)
+                                embed = self._build_embed(embed_data)
+                                await self.bot._http.edit_message(
+                                    str(stored_ch_id), str(stored_msg_id),
+                                    embeds=[embed.to_dict()],
+                                )
+                                pin_state = embed_data.get("pin_state")
+                                if pin_state == "unpin":
+                                    await self._unpin_message(str(stored_ch_id), str(stored_msg_id))
+                                elif pin_state == "pin":
+                                    await self._pin_message(str(stored_ch_id), str(stored_msg_id))
+                            else:
+                                raise RuntimeError("Fluxer LFG message binding is missing")
+                            if delivery_job_id:
+                                self._save_delivery_receipt(
+                                    db, delivery_job_id, embed_data, guild_id, channel_id,
+                                    message_id=stored_msg_id,
+                                )
+                                if await self._acknowledge_delivery(
+                                    delivery_job_id,
+                                    callback_url,
+                                    status="delivered",
+                                    guild_id=guild_id,
+                                    channel_id=stored_ch_id,
+                                    message_id=stored_msg_id,
+                                ):
+                                    dispatched_ids.append(row_id)
+                            else:
+                                dispatched_ids.append(row_id)
                             continue
 
-                        # action == "post" - send new message, pin it, store ID
+                        # --- Default: send new message ---
                         embed = self._build_embed(embed_data)
                         logger.info(f"_dispatch_pending_broadcasts: sending to guild={guild_id} channel={channel_id}")
                         resp = await self.bot._http.send_message(
@@ -427,7 +1084,7 @@ class LfgCog(Cog):
                             if track_group_id:
                                 await self._pin_message(str(channel_id), new_message_id)
 
-                            # Store message ID for future edits
+                            # Store message ID for LFG future edits
                             if track_group_id and guild_id:
                                 db.execute(
                                     text(
@@ -452,10 +1109,47 @@ class LfgCog(Cog):
                                     },
                                 )
 
-                        dispatched_ids.append(row_id)
+                            # Store message ID for post future edits/deletes
+                            if track_post_id:
+                                db.execute(text("""
+                                    INSERT INTO web_post_broadcast_messages
+                                        (post_id, platform, channel_id, message_id, created_at)
+                                    VALUES (:pid, 'fluxer', :ch, :mid, :ts)
+                                    ON DUPLICATE KEY UPDATE message_id=:mid
+                                """), {"pid": int(track_post_id), "ch": str(channel_id), "mid": new_message_id, "ts": now})
+
+                        if delivery_job_id:
+                            self._save_delivery_receipt(
+                                db, delivery_job_id, embed_data, guild_id, channel_id,
+                                message_id=new_message_id,
+                            )
+                            if await self._acknowledge_delivery(
+                                delivery_job_id,
+                                callback_url,
+                                status="delivered",
+                                guild_id=guild_id,
+                                channel_id=channel_id,
+                                message_id=new_message_id,
+                            ):
+                                dispatched_ids.append(row_id)
+                        else:
+                            dispatched_ids.append(row_id)
                     except Exception as e:
                         logger.warning(f"Failed to dispatch broadcast {row_id} to channel {channel_id}: {e}")
-                        dispatched_ids.append(row_id)  # mark done anyway to avoid infinite retry
+                        if delivery_job_id and callback_url:
+                            if await self._acknowledge_delivery(
+                                delivery_job_id,
+                                callback_url,
+                                status="failed",
+                                guild_id=guild_id,
+                                channel_id=channel_id,
+                                error_message=str(e),
+                            ):
+                                dispatched_ids.append(row_id)
+                        else:
+                            # Legacy queue rows have no durable callback and
+                            # keep their existing one-shot behavior.
+                            dispatched_ids.append(row_id)
 
                 if dispatched_ids:
                     params = {"now": now}
@@ -609,6 +1303,7 @@ class LfgCog(Cog):
         success, err = _delete_web_lfg_group(
             group_id=group_id,
             web_user_id=web_user_id or 0,
+            guild_id=str(ctx.guild.id),
             force=is_admin,
         )
 
@@ -842,7 +1537,7 @@ class LfgCog(Cog):
 
     @Cog.command()
     async def setup(self, ctx, *, args: str = ""):
-        """!setup <lfg|status>  -  Configure QuestLog Network for this server."""
+        """!setup <lfg|presence|status>  -  Configure QuestLog Network for this server."""
         subcommand = args.strip().lower().split()[0] if args.strip() else ""
         setup_guild_id = str(ctx.guild.id if ctx.guild and hasattr(ctx.guild, 'id') else (ctx.guild_id or ''))
         dashboard_url = f"{QL_BASE}/ql/dashboard/fluxer/{setup_guild_id}/" if setup_guild_id else f"{QL_BASE}/ql/dashboard/fluxer/"
@@ -853,6 +1548,8 @@ class LfgCog(Cog):
                 description=(
                     "**Commands:**\n"
                     "`!setup lfg` - Register this channel for LFG\n"
+                    "`!setup presence` - Post opt-in member game launch cards here\n"
+                    "`!setup presence-off` - Stop game launch cards\n"
                     "`!setup status` - Show current configuration\n\n"
                     f"Manage via web: [Fluxer Dashboard]({dashboard_url})"
                 ),
@@ -863,11 +1560,15 @@ class LfgCog(Cog):
 
         if subcommand == "lfg":
             await self._setup_lfg(ctx)
+        elif subcommand == "presence":
+            await self._setup_presence(ctx)
+        elif subcommand == "presence-off":
+            await self._disable_presence(ctx)
         elif subcommand == "status":
             await self._setup_status(ctx)
         else:
             await ctx.reply(embed=fluxer.Embed(
-                description=f"Unknown: `{subcommand}`. Try `!setup lfg` or `!setup status`.",
+                description=f"Unknown: `{subcommand}`. Try `!setup lfg`, `!setup presence`, `!setup presence-off`, or `!setup status`.",
                 color=RED_COLOR,
             ))
 
@@ -1059,6 +1760,12 @@ class LfgCog(Cog):
                 color=RED_COLOR,
             ))
             return
+        if not await _is_guild_admin(ctx):
+            await ctx.reply(embed=fluxer.Embed(
+                description="Only a server owner or administrator can change QuestLog channels.",
+                color=RED_COLOR,
+            ))
+            return
 
         guild_id = str(ctx.guild.id)
         guild_name = ctx.guild.name or "Unknown Server"
@@ -1126,6 +1833,56 @@ class LfgCog(Cog):
                 color=RED_COLOR,
             ))
 
+    async def _setup_presence(self, ctx):
+        """Register this channel for member-approved QuestLog game presence cards."""
+        if not ctx.guild:
+            await ctx.reply(embed=fluxer.Embed(
+                description="This command can only be used inside a server.",
+                color=RED_COLOR,
+            ))
+            return
+        if not await _is_guild_admin(ctx):
+            await ctx.reply(embed=fluxer.Embed(
+                description="Only a server owner or administrator can change QuestLog channels.",
+                color=RED_COLOR,
+            ))
+            return
+        guild_id = str(ctx.guild.id)
+        channel_id = str(ctx.channel.id)
+        channel_name = getattr(ctx.channel, "name", None) or channel_id
+        now_ts = int(time.time())
+        try:
+            with db_session_scope() as db:
+                db.execute(text(
+                    "INSERT INTO web_community_bot_configs "
+                    "(platform,guild_id,guild_name,channel_id,channel_name,event_type,is_enabled,created_at,updated_at) "
+                    "VALUES ('fluxer',:guild,:guild_name,:channel,:channel_name,'game_presence',1,:now,:now) "
+                    "ON DUPLICATE KEY UPDATE guild_name=:guild_name,channel_id=:channel,"
+                    "channel_name=:channel_name,is_enabled=1,updated_at=:now"
+                ), {
+                    "guild": guild_id,
+                    "guild_name": ctx.guild.name or "Unknown Server",
+                    "channel": channel_id,
+                    "channel_name": channel_name,
+                    "now": now_ts,
+                })
+                db.commit()
+            await ctx.reply(embed=fluxer.Embed(
+                title="Game Presence Channel Set",
+                description=(
+                    f"Opt-in QuestLog game launch cards will be posted in <#{channel_id}>.\n\n"
+                    "Only members who enable **Announce when I start a game** on QuestLog are included."
+                ),
+                color=GREEN_COLOR,
+            ))
+        except Exception as error:
+            logger.error("Game presence setup failed: %s", error, exc_info=True)
+            await ctx.reply(embed=fluxer.Embed(
+                title="Setup Failed",
+                description="Could not save the game presence channel.",
+                color=RED_COLOR,
+            ))
+
     async def _setup_status(self, ctx):
         guild_id = str(ctx.guild.id) if ctx.guild else None
         if not guild_id:
@@ -1152,7 +1909,11 @@ class LfgCog(Cog):
                 embed.description += "\n\nNo LFG channel configured yet.\nRun `!setup lfg` in the channel you want to use."
             else:
                 for event_type, channel_id, channel_name, is_enabled in rows:
-                    label = "LFG Announcements" if event_type == "lfg_announce" else event_type
+                    labels = {
+                        "lfg_announce": "LFG Announcements",
+                        "game_presence": "Game Presence",
+                    }
+                    label = labels.get(event_type, event_type)
                     status = "Enabled" if is_enabled else "Disabled"
                     channel = f"<#{channel_id}>" if channel_id else "Not set"
                     embed.add_field(name=label, value=f"{status} | {channel}", inline=False)
@@ -1164,3 +1925,22 @@ class LfgCog(Cog):
             await ctx.reply(embed=fluxer.Embed(
                 title="Error", description="Could not fetch configuration.", color=RED_COLOR
             ))
+
+    async def _disable_presence(self, ctx):
+        if not ctx.guild or not await _is_guild_admin(ctx):
+            await ctx.reply(embed=fluxer.Embed(
+                description="Only a server owner or administrator can change QuestLog channels.",
+                color=RED_COLOR,
+            ))
+            return
+        with db_session_scope() as db:
+            result = db.execute(text(
+                "UPDATE web_community_bot_configs SET is_enabled=0,updated_at=:now "
+                "WHERE platform='fluxer' AND guild_id=:guild AND event_type='game_presence'"
+            ), {"guild": str(ctx.guild.id), "now": int(time.time())})
+            db.commit()
+        message = (
+            "Game presence cards are disabled."
+            if result.rowcount else "No game presence channel was configured."
+        )
+        await ctx.reply(embed=fluxer.Embed(description=message, color=GREEN_COLOR))

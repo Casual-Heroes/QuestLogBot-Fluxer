@@ -107,6 +107,17 @@ class MemberSyncCog(Cog):
                             joined_at=None,
                         )
                     db.commit()
+                # Update member_count in guild settings with live count
+                human_count = sum(1 for m in members if not getattr(m.user, 'bot', False))
+                try:
+                    with db_session_scope() as db2:
+                        db2.execute(text(
+                            "UPDATE web_fluxer_guild_settings SET member_count = :cnt WHERE guild_id = :g"
+                        ), {'cnt': human_count, 'g': str(guild_id)})
+                        db2.commit()
+                    logger.debug(f"MemberSyncCog: updated member_count={human_count} for guild {guild_id}")
+                except Exception as e:
+                    logger.debug(f"MemberSyncCog: member_count update failed for {guild_id}: {e}")
                 return
             else:
                 logger.debug(f"MemberSyncCog: guild.fetch_members() returned empty for {guild_id} (API limitation)")
@@ -201,6 +212,11 @@ class MemberSyncCog(Cog):
                     joined_at=int(time.time()),
                 )
                 db.commit()
+                # Increment member count
+                db.execute(text(
+                    "UPDATE web_fluxer_guild_settings SET member_count = GREATEST(0, COALESCE(member_count, 0) + 1) WHERE guild_id = :g"
+                ), {'g': str(guild_id)})
+                db.commit()
             logger.debug(f"MemberSyncCog: captured join - {username} ({user_id}) in guild {guild_id}")
         except Exception as e:
             logger.error(f"MemberSyncCog: on_member_join error: {e}")
@@ -220,6 +236,10 @@ class MemberSyncCog(Cog):
                 db.execute(text(
                     "UPDATE web_fluxer_members SET left_at = :now WHERE guild_id = :g AND user_id = :u"
                 ), {'now': now, 'g': guild_id, 'u': user_id})
+                # Decrement member count
+                db.execute(text(
+                    "UPDATE web_fluxer_guild_settings SET member_count = GREATEST(0, COALESCE(member_count, 0) - 1) WHERE guild_id = :g"
+                ), {'g': str(guild_id)})
                 db.commit()
             logger.debug(f"MemberSyncCog: marked left - user {user_id} from guild {guild_id}")
         except Exception as e:

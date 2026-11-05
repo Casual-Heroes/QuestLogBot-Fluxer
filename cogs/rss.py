@@ -9,12 +9,16 @@
 
 import asyncio
 import html as _html_module
+import ipaddress
 import json
 import re
+import socket
 import time as time_lib
 from typing import Optional, Tuple, List, Any
+from urllib.parse import urljoin, urlsplit
 
 import fluxer
+import urllib3
 from fluxer import Cog
 from sqlalchemy import text
 
@@ -24,14 +28,10 @@ RSS_POLL_INTERVAL = 5 * 60       # Check every 5 minutes; per-feed interval enfo
 RSS_FETCH_TIMEOUT = 30
 RSS_MAX_SIZE = 5 * 1024 * 1024   # 5 MB
 RSS_MAX_REDIRECTS = 5
+RSS_MAX_ADDRESSES = 4
 PORTAL_BASE_URL = "https://casual-heroes.com/ql/fluxer"
 
 ALLOWED_LINK_SCHEMES = {'http', 'https'}
-
-try:
-    import requests as _requests
-except ImportError:
-    _requests = None
 
 try:
     import feedparser as _feedparser
@@ -70,87 +70,171 @@ def _truncate(s: Optional[str], limit: int) -> Optional[str]:
     return s[:limit] if len(s) <= limit else s[:limit - 3] + '...'
 
 
+def _resolve_public_addresses(hostname: str, port: int) -> Tuple[List[str], Optional[str]]:
+    """Resolve once and reject the complete answer set if any IP is non-public."""
+    try:
+        answers = socket.getaddrinfo(
+            hostname, port, type=socket.SOCK_STREAM,
+        )
+    except OSError:
+        return [], 'DNS resolution failed'
+
+    addresses = []
+    for _family, _socktype, _proto, _canonname, sockaddr in answers:
+        address = str(sockaddr[0])
+        try:
+            parsed_address = ipaddress.ip_address(address)
+        except ValueError:
+            return [], 'DNS returned an invalid address'
+        if not parsed_address.is_global:
+            return [], f'Private/internal IP not allowed: {address}'
+        if address not in addresses:
+            addresses.append(address)
+    if not addresses:
+        return [], 'DNS returned no addresses'
+    # Bound connection attempts while still validating the complete DNS set.
+    ipv4 = [item for item in addresses if ipaddress.ip_address(item).version == 4]
+    ipv6 = [item for item in addresses if ipaddress.ip_address(item).version == 6]
+    selected = ipv4[:2] + ipv6[:2]
+    for address in addresses:
+        if address not in selected and len(selected) < RSS_MAX_ADDRESSES:
+            selected.append(address)
+    return selected, None
+
+
+def _fetch_pinned_once(
+    url: str, deadline: Optional[float] = None,
+) -> Tuple[Optional[int], Any, bytes, Optional[str]]:
+    """Fetch one URL by its validated IP while retaining the hostname for TLS."""
+    try:
+        parsed = urlsplit(url)
+        port = parsed.port or (443 if parsed.scheme.lower() == 'https' else 80)
+    except (TypeError, ValueError):
+        return None, {}, b'', 'Invalid URL'
+    scheme = parsed.scheme.lower()
+    hostname = (parsed.hostname or '').rstrip('.')
+    try:
+        hostname = hostname.encode('idna').decode('ascii').lower()
+    except UnicodeError:
+        return None, {}, b'', 'Invalid hostname'
+    if scheme not in ('http', 'https') or not hostname:
+        return None, {}, b'', 'URL must be http or https'
+    if parsed.username or parsed.password:
+        return None, {}, b'', 'URL credentials are not allowed'
+
+    blocked_suffixes = (
+        '.local', '.internal', '.private', '.corp', '.lan',
+        '.intranet', '.localdomain',
+    )
+    if hostname == 'localhost' or hostname.endswith(blocked_suffixes):
+        return None, {}, b'', 'Internal domains not allowed'
+
+    addresses, error = _resolve_public_addresses(hostname, port)
+    if error:
+        return None, {}, b'', error
+
+    request_target = urllib3.util.url._encode_target(
+        (parsed.path or '/') + (f'?{parsed.query}' if parsed.query else '')
+    )
+    host_header = hostname
+    if ':' in hostname:
+        host_header = f'[{hostname}]'
+    if port != (443 if scheme == 'https' else 80):
+        host_header = f'{host_header}:{port}'
+    headers = {
+        'Host': host_header,
+        'User-Agent': 'QuestLog RSS Bot/1.0 (+https://casual-heroes.com/)',
+        'Accept-Encoding': 'identity',
+    }
+
+    last_error = 'Connection failed'
+    deadline = deadline or (time_lib.monotonic() + RSS_FETCH_TIMEOUT)
+    for address in addresses:
+        pool = None
+        response = None
+        try:
+            remaining = deadline - time_lib.monotonic()
+            if remaining <= 0:
+                return None, {}, b'', 'Request timed out'
+            timeout = urllib3.Timeout(total=remaining)
+            if scheme == 'https':
+                pool = urllib3.HTTPSConnectionPool(
+                    address,
+                    port=port,
+                    timeout=timeout,
+                    maxsize=1,
+                    block=True,
+                    assert_hostname=hostname,
+                    server_hostname=hostname,
+                    cert_reqs='CERT_REQUIRED',
+                )
+            else:
+                pool = urllib3.HTTPConnectionPool(
+                    address,
+                    port=port,
+                    timeout=timeout,
+                    maxsize=1,
+                    block=True,
+                )
+            response = pool.request(
+                'GET', request_target, headers=headers,
+                preload_content=False, redirect=False, retries=False,
+            )
+            content_length = response.headers.get('Content-Length')
+            if content_length:
+                try:
+                    if int(content_length) > RSS_MAX_SIZE:
+                        return None, {}, b'', 'Feed too large (>5MB)'
+                except ValueError:
+                    return None, {}, b'', 'Invalid Content-Length'
+            body = response.read(RSS_MAX_SIZE + 1, decode_content=True)
+            if len(body) > RSS_MAX_SIZE:
+                return None, {}, b'', 'Feed too large (>5MB)'
+            return response.status, response.headers, body, None
+        except Exception as exc:
+            last_error = str(exc)
+        finally:
+            if response is not None:
+                response.release_conn()
+            if pool is not None:
+                pool.close()
+    return None, {}, b'', last_error
+
+
 def _secure_fetch_sync(url: str) -> Tuple[Optional[Any], Optional[str]]:
     """Synchronous SSRF-safe RSS fetch. Returns (parsed, error)."""
-    from urllib.parse import urlparse
-    import ipaddress
-    import socket
 
     if not url:
         return None, 'URL is required'
     url = url.strip()
     try:
-        parsed_url = urlparse(url)
-    except Exception:
+        parsed_url = urlsplit(url)
+    except (TypeError, ValueError):
         return None, 'Invalid URL'
-    if parsed_url.scheme not in ('http', 'https'):
+    if parsed_url.scheme.lower() not in ('http', 'https'):
         return None, 'URL must be http or https'
-    hostname = parsed_url.hostname
-    if not hostname:
+    if not parsed_url.hostname:
         return None, 'No hostname'
-
-    blocked_hosts = {'localhost', '127.0.0.1', '::1', '0.0.0.0'}
-    if hostname.lower() in blocked_hosts:
-        return None, 'Localhost not allowed'
-
-    blocked_suffixes = ['.local', '.internal', '.private', '.corp', '.lan', '.intranet', '.localdomain']
-    for suf in blocked_suffixes:
-        if hostname.lower().endswith(suf):
-            return None, f'Internal domains not allowed'
-
-    try:
-        for _fam, _t, _p, _cn, sockaddr in socket.getaddrinfo(hostname, None):
-            ip = ipaddress.ip_address(sockaddr[0])
-            if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
-                return None, f'Private/internal IP not allowed: {sockaddr[0]}'
-    except socket.gaierror:
-        pass  # DNS fail - let fetch handle it
-
-    if _requests is None:
-        return None, 'requests library not available'
     if _feedparser is None:
         return None, 'feedparser library not available'
 
     try:
         current_url = url
+        deadline = time_lib.monotonic() + RSS_FETCH_TIMEOUT
         for _ in range(RSS_MAX_REDIRECTS + 1):
-            resp = _requests.get(
-                current_url,
-                timeout=RSS_FETCH_TIMEOUT,
-                stream=True,
-                allow_redirects=False,
-                headers={'User-Agent': 'QuestLog RSS Bot/1.0 (+https://casual-heroes.com/)'},
+            status, headers, content, error = _fetch_pinned_once(
+                current_url, deadline,
             )
-            if resp.status_code in (301, 302, 303, 307, 308):
-                loc = resp.headers.get('Location', '')
+            if error:
+                return None, error
+            if status in (301, 302, 303, 307, 308):
+                loc = headers.get('Location', '')
                 if not loc:
                     return None, 'Redirect with no Location header'
-                # Re-validate redirect target - prevents SSRF via open redirects
-                # Validate URL structure before following
-                try:
-                    redir_parsed = urlparse(loc)
-                    if redir_parsed.scheme not in ('http', 'https'):
-                        return None, 'Redirect to non-HTTP URL blocked'
-                    redir_host = redir_parsed.hostname or ''
-                    if redir_host.lower() in blocked_hosts:
-                        return None, 'Redirect to localhost blocked'
-                    for suf in blocked_suffixes:
-                        if redir_host.lower().endswith(suf):
-                            return None, 'Redirect to internal domain blocked'
-                    for _fam, _t, _p, _cn, sockaddr in socket.getaddrinfo(redir_host, None):
-                        ip = ipaddress.ip_address(sockaddr[0])
-                        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
-                            return None, f'Redirect to private IP blocked: {sockaddr[0]}'
-                except socket.gaierror:
-                    pass
-                current_url = loc
+                current_url = urljoin(current_url, loc)
                 continue
-
-            content = b''
-            for chunk in resp.iter_content(chunk_size=65536):
-                content += chunk
-                if len(content) > RSS_MAX_SIZE:
-                    return None, 'Feed too large (>5MB)'
+            if status is None or not 200 <= status < 300:
+                return None, f'Feed server returned HTTP {status}'
             parsed = _feedparser.parse(content)
             return parsed, None
 
